@@ -1,0 +1,34 @@
+name: Sync upstream OpenPI
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  fast-forward-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sync
+          fetch-depth: 0
+
+      - name: Fast-forward the upstream mirror
+        run: |
+          git remote add upstream https://github.com/Physical-Intelligence/openpi.git
+          git fetch --no-tags origin main
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor origin/main upstream/main; then
+            git push origin upstream/main:refs/heads/main
+          else
+            echo "::error::main diverged from upstream; refusing a non-fast-forward sync"
+            exit 1
+          fi
