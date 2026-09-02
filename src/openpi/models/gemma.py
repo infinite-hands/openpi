@@ -161,7 +161,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache, collect_attention=False):
+    def __call__(self, xs, positions, attn_mask, kv_cache, collect_attention=False):  # noqa: FBT002
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -247,9 +247,7 @@ class Attention(nn.Module):
                 out.append(None)
 
         if collect_attention:
-            summary = jax.lax.stop_gradient(
-                jnp.mean(probs.astype(jnp.float32), axis=(1, 2, 3))
-            )
+            summary = jax.lax.stop_gradient(jnp.mean(probs.astype(jnp.float32), axis=(1, 2, 3)))
             return out, (k, v), summary
         return out, (k, v)
 
@@ -295,9 +293,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(
-        self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, collect_attention=False
-    ):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, collect_attention=False):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -373,7 +369,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5, 6),  # deterministic and collect_attention
+            static_argnums=(6, 7),  # self is index 0; these flags control Python branches.
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -418,9 +414,7 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        layer_result = self.layers(
-            embedded, kv_cache, positions, mask, adarms_cond, deterministic, collect_attention
-        )
+        layer_result = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, collect_attention)
         if collect_attention:
             embedded, (kv_cache, attention_by_layer) = layer_result
         else:
