@@ -424,7 +424,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices
+                nn.broadcast,
+            ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices, key count
             length=self.configs[0].depth,
         )(
             configs=self.configs,
