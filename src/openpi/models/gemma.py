@@ -161,7 +161,16 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache, collect_attention=False):  # noqa: FBT002
+    def __call__(
+        self,
+        xs,
+        positions,
+        attn_mask,
+        kv_cache,
+        collect_attention=False,  # noqa: FBT002
+        attention_query_indices=None,
+        attention_key_count: int | None = None,
+    ):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -247,7 +256,21 @@ class Attention(nn.Module):
                 out.append(None)
 
         if collect_attention:
-            summary = jax.lax.stop_gradient(jnp.mean(probs.astype(jnp.float32), axis=(1, 2, 3)))
+            attention = probs.astype(jnp.float32)
+            if attention_query_indices is None:
+                summary = jnp.mean(attention, axis=(1, 2, 3))
+            else:
+                if attention_key_count is None:
+                    raise ValueError("attention_key_count is required for selected attention queries")
+                if attention_query_indices.ndim != 2 or attention_query_indices.shape[0] != attention.shape[0]:
+                    raise ValueError("attention_query_indices must be shaped (batch, selected_queries)")
+                selected_keys = attention[..., :attention_key_count]
+                indices = jnp.broadcast_to(
+                    attention_query_indices[:, None, None, :, None],
+                    (*selected_keys.shape[:3], attention_query_indices.shape[1], attention_key_count),
+                )
+                summary = jnp.mean(jnp.take_along_axis(selected_keys, indices, axis=3), axis=(1, 2))
+            summary = jax.lax.stop_gradient(summary)
             return out, (k, v), summary
         return out, (k, v)
 
@@ -293,7 +316,18 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, collect_attention=False):  # noqa: FBT002
+    def __call__(
+        self,
+        xs,
+        kv_cache,
+        positions,
+        attn_mask,
+        adarms_cond,
+        deterministic=True,  # noqa: FBT002
+        collect_attention=False,  # noqa: FBT002
+        attention_query_indices=None,
+        attention_key_count: int | None = None,
+    ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -310,7 +344,13 @@ class Block(nn.Module):
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
         if collect_attention:
             post_attn, kv_cache, attention_summary = attn(
-                pre_attn, positions, attn_mask, kv_cache, collect_attention=True
+                pre_attn,
+                positions,
+                attn_mask,
+                kv_cache,
+                collect_attention=True,
+                attention_query_indices=attention_query_indices,
+                attention_key_count=attention_key_count,
             )
         else:
             post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
@@ -369,7 +409,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(6, 7),  # self is index 0; these flags control Python branches.
+            static_argnums=(6, 7, 9),  # self is index 0; these flags control Python branches and slices.
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -383,7 +423,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # kv_cache, positions, mask, adarms_cond, deterministic, collect_attention
+                nn.broadcast,
+            ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -408,13 +449,25 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
         collect_attention: bool = False,
+        attention_query_indices: at.Int[at.Array, "b selected_queries"] | None = None,
+        attention_key_count: int | None = None,
     ) -> tuple:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        layer_result = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, collect_attention)
+        layer_result = self.layers(
+            embedded,
+            kv_cache,
+            positions,
+            mask,
+            adarms_cond,
+            deterministic,
+            collect_attention,
+            attention_query_indices,
+            attention_key_count,
+        )
         if collect_attention:
             embedded, (kv_cache, attention_by_layer) = layer_result
         else:
