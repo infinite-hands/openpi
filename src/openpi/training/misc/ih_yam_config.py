@@ -26,9 +26,9 @@ def _model() -> pi0_config.Pi0Config:
 
 
 def get_ih_yam_configs():
-    from openpi.training.config import AssetsConfig  # noqa: PLC0415
-    from openpi.training.config import LeRobotAlohaDataConfig  # noqa: PLC0415
-    from openpi.training.config import TrainConfig  # noqa: PLC0415
+    from openpi.training.config import AssetsConfig
+    from openpi.training.config import LeRobotAlohaDataConfig
+    from openpi.training.config import TrainConfig
 
     def data_config(repo_id: str, prompt: str, *, assets: AssetsConfig | None = None):
         return LeRobotAlohaDataConfig(
