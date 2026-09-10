@@ -11,6 +11,7 @@ import openpi.transforms as _transforms
 PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
 PART_ADAPT_PARAMS = "/checkpoints/fine-tuned/pi05_yam_bagging_three/v1/19999/params"
 PART_ADAPT_BASE_ASSET = "local/yam_bagging_three"
+# The directory and asset id must stay paired so adaptation uses the base policy's quantiles.
 PART_ADAPT_BASE_ASSETS_DIR = "/checkpoints/assets/pi05_yam_bagging_three"
 PART_ADAPT_REPO_ID = "local/yam_part_adapt_current"
 PART_ADAPT_STEPS = 800
@@ -26,6 +27,7 @@ def _model() -> pi0_config.Pi0Config:
 
 
 def get_ih_yam_configs():
+    # These imports are deferred because config.py expands this function while building its registry.
     from openpi.training.config import AssetsConfig
     from openpi.training.config import LeRobotAlohaDataConfig
     from openpi.training.config import TrainConfig
@@ -97,6 +99,7 @@ def get_ih_yam_configs():
             ),
             save_interval=200,
             keep_period=PART_ADAPT_STEPS,
+            # OpenPI names action-expert leaves with an llm _1 suffix; train only their LoRA weights.
             freeze_filter=nnx.Any(
                 part_model.get_freeze_filter(),
                 nnx.Not(
@@ -126,5 +129,6 @@ def get_ih_yam_configs():
             freeze_filter=part_model.get_freeze_filter(),
             ema_decay=None,
         ),
+        # Historical checkpoints use this name; new full runs use pi05_yam_bagging.
         standard_config("pi05_yam_bagging_three", "local/yam_bagging_three", bagging_prompt),
     ]
