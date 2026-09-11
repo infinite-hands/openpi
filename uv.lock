@@ -3116,7 +3116,6 @@ dependencies = [
     { name = "treescope" },
     { name = "typing-extensions" },
     { name = "tyro" },
-    { name = "wandb" },
 ]
 
 [package.dev-dependencies]
@@ -3168,7 +3167,6 @@ requires-dist = [
     { name = "treescope", specifier = ">=0.1.7" },
     { name = "typing-extensions", specifier = ">=4.12.2" },
     { name = "tyro", specifier = ">=0.9.5" },
-    { name = "wandb", specifier = ">=0.19.1" },
 ]
 
 [package.metadata.requires-dev]

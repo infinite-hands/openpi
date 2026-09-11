@@ -467,8 +467,6 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
-    # Project name.
-    project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
 
@@ -522,9 +520,6 @@ class TrainConfig:
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
     resume: bool = False
-
-    # If true, will enable wandb logging.
-    wandb_enabled: bool = True
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -943,7 +938,6 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
-        wandb_enabled=False,
     ),
     TrainConfig(
         name="debug_restore",
@@ -954,7 +948,6 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
-        wandb_enabled=False,
     ),
     TrainConfig(
         name="debug_pi05",
@@ -964,7 +957,6 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
-        wandb_enabled=False,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
