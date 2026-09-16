@@ -1,7 +1,9 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -200,7 +202,8 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    compilation_cache_dir = os.environ.get("OPENPI_JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path(compilation_cache_dir).expanduser()))
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -223,7 +226,10 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
+    interval_started = time.monotonic()
+    data_started = time.monotonic()
     batch = next(data_iter)
+    host_data_wait_s = time.monotonic() - data_started
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -263,11 +269,18 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info["wall_s_per_step"] = (time.monotonic() - interval_started) / len(infos)
+            reduced_info["host_data_wait_s_per_step"] = host_data_wait_s / len(infos)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
+            logging.info(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+            interval_started = time.monotonic()
+            host_data_wait_s = 0.0
+        data_started = time.monotonic()
         batch = next(data_iter)
+        host_data_wait_s += time.monotonic() - data_started
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
