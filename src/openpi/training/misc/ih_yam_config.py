@@ -7,6 +7,7 @@ from openpi.shared import nnx_utils
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+from openpi.training.misc.ih_weighted_loss import Pi0WeightedConfig, WeightedLossConfig
 
 PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
 PART_ADAPT_PARAMS = "/checkpoints/fine-tuned/pi05_yam_bagging_three/v1/19999/params"
@@ -127,6 +128,43 @@ def get_ih_yam_configs():
             save_interval=200,
             keep_period=PART_ADAPT_STEPS,
             freeze_filter=part_model.get_freeze_filter(),
+            ema_decay=None,
+        ),
+        # A/B variant of pi05_yam_part_adapt with the critical-window weighted loss
+        # (openpi.training.misc.ih_weighted_loss): same data, warm start, schedule and freeze
+        # filter as pi05_yam_part_adapt, so a comparison against it isolates the loss. The loss
+        # knobs are `--model.loss.*` overrides.
+        TrainConfig(
+            name="pi05_yam_part_adapt_wl",
+            model=(part_model_wl := Pi0WeightedConfig(
+                pi05=True,
+                action_horizon=30,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+                loss=WeightedLossConfig(
+                    norm_stats_dir=f"{PART_ADAPT_BASE_ASSETS_DIR}/{PART_ADAPT_BASE_ASSET}"),
+            )),
+            data=data_config(PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets),
+            weight_loader=weight_loaders.CheckpointWeightLoader(PART_ADAPT_PARAMS),
+            batch_size=64,
+            num_train_steps=PART_ADAPT_STEPS,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=50,
+                peak_lr=5e-6,
+                decay_steps=PART_ADAPT_STEPS,
+                decay_lr=5e-7,
+            ),
+            save_interval=200,
+            keep_period=PART_ADAPT_STEPS,
+            freeze_filter=nnx.Any(
+                part_model_wl.get_freeze_filter(),
+                nnx.Not(
+                    nnx.All(
+                        nnx_utils.PathRegex(".*llm.*_1.*"),
+                        nnx_utils.PathRegex(".*lora.*"),
+                    )
+                ),
+            ),
             ema_decay=None,
         ),
         # Historical checkpoints use this name; new full runs use pi05_yam_bagging.
