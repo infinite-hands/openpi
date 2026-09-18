@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.misc.ih_imle_config as ih_imle_config
 import openpi.training.misc.ih_yam_config as ih_yam_config
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -970,6 +971,7 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
     *ih_yam_config.get_ih_yam_configs(),
+    *ih_imle_config.get_ih_imle_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

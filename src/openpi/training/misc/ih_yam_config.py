@@ -15,6 +15,7 @@ PART_ADAPT_BASE_ASSET = "local/yam_bagging_three"
 PART_ADAPT_BASE_ASSETS_DIR = "/checkpoints/assets/pi05_yam_bagging_three"
 PART_ADAPT_REPO_ID = "local/yam_part_adapt_current"
 PART_ADAPT_STEPS = 800
+BAGGING_PROMPT = "place one part in the bag"
 
 
 def _model() -> pi0_config.Pi0Config:
@@ -26,35 +27,42 @@ def _model() -> pi0_config.Pi0Config:
     )
 
 
+def get_ih_yam_data_config(repo_id: str, prompt: str, *, assets=None):
+    """The YAM camera/state layout every Infinite Hands config on this fork trains through."""
+    from openpi.training.config import AssetsConfig
+    from openpi.training.config import LeRobotAlohaDataConfig
+
+    return LeRobotAlohaDataConfig(
+        repo_id=repo_id,
+        assets=assets or AssetsConfig(),
+        default_prompt=prompt,
+        adapt_to_pi=False,
+        use_delta_joint_actions=True,
+        repack_transforms=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        ),
+    )
+
+
 def get_ih_yam_configs():
     # These imports are deferred because config.py expands this function while building its registry.
     from openpi.training.config import AssetsConfig
     from openpi.training.config import LeRobotAlohaDataConfig
     from openpi.training.config import TrainConfig
 
-    def data_config(repo_id: str, prompt: str, *, assets: AssetsConfig | None = None):
-        return LeRobotAlohaDataConfig(
-            repo_id=repo_id,
-            assets=assets or AssetsConfig(),
-            default_prompt=prompt,
-            adapt_to_pi=False,
-            use_delta_joint_actions=True,
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        )
+    data_config = get_ih_yam_data_config
 
     def standard_config(name: str, repo_id: str, prompt: str):
         model = _model()
@@ -72,7 +80,7 @@ def get_ih_yam_configs():
             ema_decay=None,
         )
 
-    bagging_prompt = "place one part in the bag"
+    bagging_prompt = BAGGING_PROMPT
     part_model = _model()
     part_assets = AssetsConfig(
         assets_dir=PART_ADAPT_BASE_ASSETS_DIR,
