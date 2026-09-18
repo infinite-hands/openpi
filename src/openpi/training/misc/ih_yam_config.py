@@ -59,17 +59,14 @@ def get_ih_yam_data_config(repo_id: str, prompt: str, *, assets=None):
 def get_ih_yam_configs():
     # These imports are deferred because config.py expands this function while building its registry.
     from openpi.training.config import AssetsConfig
-    from openpi.training.config import LeRobotAlohaDataConfig
     from openpi.training.config import TrainConfig
-
-    data_config = get_ih_yam_data_config
 
     def standard_config(name: str, repo_id: str, prompt: str):
         model = _model()
         return TrainConfig(
             name=name,
             model=model,
-            data=data_config(repo_id, prompt),
+            data=get_ih_yam_data_config(repo_id, prompt),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
             batch_size=64,
             num_train_steps=20_000,
@@ -95,7 +92,7 @@ def get_ih_yam_configs():
         TrainConfig(
             name="pi05_yam_part_adapt",
             model=part_model,
-            data=data_config(PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets),
+            data=get_ih_yam_data_config(PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets),
             weight_loader=weight_loaders.CheckpointWeightLoader(PART_ADAPT_PARAMS),
             batch_size=64,
             num_train_steps=PART_ADAPT_STEPS,
@@ -122,7 +119,7 @@ def get_ih_yam_configs():
         TrainConfig(
             name="pi05_yam_part_adapt_full",
             model=part_model,
-            data=data_config(PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets),
+            data=get_ih_yam_data_config(PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets),
             weight_loader=weight_loaders.CheckpointWeightLoader(PART_ADAPT_PARAMS),
             batch_size=64,
             num_train_steps=PART_ADAPT_STEPS,
