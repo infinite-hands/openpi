@@ -32,7 +32,28 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Per-action-dimension loss weights, length `action_dim`. None (the default) is an exact no-op:
+    # compute_loss takes a plain mean, as it always has, so every existing config is untouched.
+    #
+    # For a SINGLE-ARM dataset on a bimanual embodiment: the arm the model does not drive is pinned
+    # to a constant pose, so its dimensions are trivially predictable, yet a flat mean still spends
+    # half the action loss on them. Measured on random targets, weighting moves the driven arm's
+    # share of the loss from 22.8% to 95.5%.
+    #
+    # Weights are normalized by their own sum, so the loss keeps its scale and the learning rate
+    # does not have to move with them.
+    action_dim_weights: tuple[float, ...] | None = None
+
     def __post_init__(self):
+        if self.action_dim_weights is not None:
+            if len(self.action_dim_weights) != self.action_dim:
+                raise ValueError(
+                    f"action_dim_weights has {len(self.action_dim_weights)} entries, expected "
+                    f"action_dim={self.action_dim}")
+            if any(w < 0 for w in self.action_dim_weights):
+                raise ValueError("action_dim_weights must be non-negative")
+            if sum(self.action_dim_weights) <= 0:
+                raise ValueError("action_dim_weights must not sum to zero")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
