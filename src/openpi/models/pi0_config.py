@@ -34,7 +34,30 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # Per-action-dimension loss weights, length `action_dim`. None (the default) is an exact no-op:
+    # compute_loss takes a plain mean, as it always has, so every existing config is untouched.
+    #
+    # What this is for: a SINGLE-ARM dataset on a bimanual embodiment. The arm the model does not
+    # drive is pinned to a constant pose, so its seven dimensions are trivially predictable, yet a
+    # flat mean still spends half the action loss on them. This repo has already been bitten by the
+    # severe form -- a mis-supervised parked arm once accounted for ~99.99% of the training loss
+    # (338 vs a healthy 0.03), which is what data_collection/parked_arm.py exists to repair.
+    # Down-weighting those dims keeps the gradient on the arm that is actually being learned.
+    #
+    # Weights are normalized by their own sum, so the loss keeps its scale and the learning rate
+    # does not have to move with them.
+    action_dim_weights: tuple[float, ...] | None = None
+
     def __post_init__(self):
+        if self.action_dim_weights is not None:
+            if len(self.action_dim_weights) != self.action_dim:
+                raise ValueError(
+                    f"action_dim_weights has {len(self.action_dim_weights)} entries, expected "
+                    f"action_dim={self.action_dim}")
+            if any(w < 0 for w in self.action_dim_weights):
+                raise ValueError("action_dim_weights must be non-negative")
+            if sum(self.action_dim_weights) <= 0:
+                raise ValueError("action_dim_weights must not sum to zero")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
