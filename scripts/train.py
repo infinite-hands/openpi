@@ -89,6 +89,9 @@ def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    # Created once and closed over, for the same reason `tx` above is: it lands in static pytree
+    # metadata, and `init` below runs twice (eval_shape then jit). See wam_aux.init_aux_state.
+    aux_tx = optax.adam(config.aux_learning_rate) if config.aux_loss_weight > 0 else None
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -134,6 +137,7 @@ def init_train_state(
                 action_dim=config.model.action_dim,
                 learning_rate=config.aux_learning_rate,
                 rngs=nnx.Rngs(jax.random.fold_in(rng, 0x4157)),
+                tx=aux_tx,
             )
             # Seeded from the initial params, and kept separate from `ema_params` so that enabling
             # this loss cannot change what a checkpoint exports for inference.

@@ -300,12 +300,29 @@ class AuxState:
     tx: optax.GradientTransformation = struct.field(pytree_node=False)
 
 
-def init_aux_state(*, action_dim: int, learning_rate: float, rngs: nnx.Rngs) -> AuxState:
+def init_aux_state(
+    *,
+    action_dim: int,
+    learning_rate: float,
+    rngs: nnx.Rngs,
+    tx: optax.GradientTransformation | None = None,
+) -> AuxState:
+    """`tx` should be created ONCE by the caller and reused across every call.
+
+    `AuxState.tx` is `pytree_node=False`, so it is static pytree METADATA that JAX compares by
+    equality -- and `optax.adam()` mints fresh closure objects each call, which never compare
+    equal. openpi's `init_train_state` calls its `init` twice (once under `jax.eval_shape` to
+    derive shardings, once under `jax.jit`), so building the optimizer in here produced two
+    unequal AuxStates and jit rejected them with a pytree metadata mismatch on `out_shardings.aux`.
+    openpi's own TrainState.tx sidesteps this by being created once outside `init` and closed over;
+    this mirrors that.
+    """
     projection = AuxProjection(rngs=rngs)
     predictor = AuxFuturePredictor(action_dim=action_dim, rngs=rngs)
     projection_graphdef, projection_params = nnx.split(projection)
     predictor_graphdef, predictor_params = nnx.split(predictor)
-    tx = optax.adam(learning_rate)
+    if tx is None:
+        tx = optax.adam(learning_rate)
     opt_state = tx.init(
         (projection_params.filter(nnx.All(nnx.Param)), predictor_params.filter(nnx.All(nnx.Param)))
     )
