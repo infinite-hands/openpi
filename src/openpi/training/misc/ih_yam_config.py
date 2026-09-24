@@ -36,6 +36,10 @@ def get_ih_yam_configs():
     # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). The raw LeRobot column the
     # future frame is taken from, and the private keys it travels under afterwards.
     AUX_RAW_KEY = "observation.images.cam_right_wrist"
+    # ~1.0s at 30Hz, in the range JEPA-WAM uses (31 on LIBERO, 50 on RoboTwin). Must stay below
+    # model.action_horizon, since it also selects the conditioning action window; TrainConfig's
+    # __post_init__ enforces that.
+    WAM_AUX_OFFSET_K = 29
     AUX_FUTURE_REPACK_KEY = "aux_future_image"
     AUX_PAD_REPACK_KEY = "aux_future_is_pad_raw"
 
@@ -150,6 +154,38 @@ def get_ih_yam_configs():
             keep_period=PART_ADAPT_STEPS,
             freeze_filter=part_model.get_freeze_filter(),
             ema_decay=None,
+        ),
+        # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). Its own config rather
+        # than CLI flags on part_adapt_full, because aux_loss_offset_k determines the DATA pipeline
+        # shape -- it sets the extra delta_timestamps entry and whether SplitFutureFrame is
+        # installed -- and that is fixed when this object is constructed, long before any CLI
+        # override is parsed. aux_loss_weight and aux_learning_rate ARE still CLI-tunable, since
+        # they only affect the loss.
+        #
+        # Built on part_adapt_full, not part_adapt: the latter freezes everything except its
+        # action-expert adapters, including the vision tower, which is the only thing the aux loss
+        # can influence. train.py raises rather than training a no-op if that is ever forgotten.
+        TrainConfig(
+            name="pi05_yam_part_adapt_full_wam",
+            model=part_model,
+            data=data_config(
+                PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets, aux_future_k=WAM_AUX_OFFSET_K
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(PART_ADAPT_PARAMS),
+            batch_size=64,
+            num_train_steps=PART_ADAPT_STEPS,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=50,
+                peak_lr=5e-6,
+                decay_steps=PART_ADAPT_STEPS,
+                decay_lr=5e-7,
+            ),
+            save_interval=200,
+            keep_period=PART_ADAPT_STEPS,
+            freeze_filter=part_model.get_freeze_filter(),
+            ema_decay=None,
+            aux_loss_weight=0.05,
+            aux_loss_offset_k=WAM_AUX_OFFSET_K,
         ),
         # Historical checkpoints use this name; new full runs use pi05_yam_bagging.
         standard_config("pi05_yam_bagging_three", "local/yam_bagging_three", bagging_prompt),
