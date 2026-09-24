@@ -6,6 +6,7 @@ import openpi.models.pi0_config as pi0_config
 from openpi.shared import nnx_utils
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
+import openpi.models.model as _model_mod
 import openpi.transforms as _transforms
 
 PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
@@ -32,28 +33,49 @@ def get_ih_yam_configs():
     from openpi.training.config import LeRobotAlohaDataConfig
     from openpi.training.config import TrainConfig
 
-    def data_config(repo_id: str, prompt: str, *, assets: AssetsConfig | None = None):
+    # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). The raw LeRobot column the
+    # future frame is taken from, and the private keys it travels under afterwards.
+    AUX_RAW_KEY = "observation.images.cam_right_wrist"
+    AUX_FUTURE_REPACK_KEY = "aux_future_image"
+    AUX_PAD_REPACK_KEY = "aux_future_is_pad_raw"
+
+    def data_config(
+        repo_id: str, prompt: str, *, assets: AssetsConfig | None = None, aux_future_k: int | None = None
+    ):
+        repack_structure = {
+            "images": {
+                "cam_high": "observation.images.cam_high",
+                "cam_left_wrist": "observation.images.cam_left_wrist",
+                "cam_right_wrist": "observation.images.cam_right_wrist",
+            },
+            "state": "observation.state",
+            "actions": "action",
+        }
+        repack_inputs = []
+        if aux_future_k is not None:
+            # Must precede RepackTransform (which reconstructs and would drop these keys) and
+            # therefore also precedes AlohaInputs, which raises on a fourth camera and whose
+            # convert_image is strictly 3-D -- a stacked (2, C, H, W) column reaching it crashes.
+            repack_inputs.append(
+                _transforms.SplitFutureFrame(
+                    raw_key=AUX_RAW_KEY,
+                    future_key=AUX_FUTURE_REPACK_KEY,
+                    pad_key=AUX_PAD_REPACK_KEY,
+                )
+            )
+            repack_structure[_model_mod.AUX_FUTURE_IMAGE_KEY] = AUX_FUTURE_REPACK_KEY
+            repack_structure[_model_mod.AUX_FUTURE_PAD_KEY] = AUX_PAD_REPACK_KEY
+        repack_inputs.append(_transforms.RepackTransform(repack_structure))
+
         return LeRobotAlohaDataConfig(
             repo_id=repo_id,
             assets=assets or AssetsConfig(),
             default_prompt=prompt,
             adapt_to_pi=False,
             use_delta_joint_actions=True,
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
+            repack_transforms=_transforms.Group(inputs=repack_inputs),
+            aux_future_image_key=AUX_RAW_KEY if aux_future_k is not None else None,
+            aux_future_k=aux_future_k,
         )
 
     def standard_config(name: str, repo_id: str, prompt: str):

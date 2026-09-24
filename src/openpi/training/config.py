@@ -88,6 +88,12 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). When set, the loader asks
+    # LeRobot for ONE extra frame of this column, `aux_future_k` steps ahead, so the aux loss has a
+    # future target. None leaves the loader bit-identical to a build without the feature.
+    aux_future_image_key: str | None = None
+    aux_future_k: int | None = None
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -255,6 +261,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
+    # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). Forwarded onto the DataConfig
+    # below; this factory RECONSTRUCTS its DataConfig via dataclasses.replace, so a field not named
+    # there is silently dropped rather than inherited.
+    aux_future_image_key: str | None = None
+    aux_future_k: int | None = None
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
@@ -276,6 +288,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            aux_future_image_key=self.aux_future_image_key,
+            aux_future_k=self.aux_future_k,
         )
 
 

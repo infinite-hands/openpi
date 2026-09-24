@@ -4,6 +4,7 @@ from typing import ClassVar
 import einops
 import numpy as np
 
+import openpi.models.model as _model
 from openpi import transforms
 
 
@@ -83,6 +84,16 @@ class AlohaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). Only present when the
+        # data config requested the extra frame. Placed INSIDE inputs["image"] under a private key
+        # purely so ResizeImages -- which iterates that dict generically -- resizes it exactly like
+        # a real camera; Observation.from_dict pops it back out before `images` is read, so it
+        # never reaches embed_prefix as a fourth camera. Reuses the same CHW->HWC and float->uint8
+        # conversion the real cameras got, rather than duplicating it.
+        if _model.AUX_FUTURE_IMAGE_KEY in data:
+            inputs["image"][_model.AUX_FUTURE_IMAGE_KEY] = data[_model.AUX_FUTURE_IMAGE_KEY]
+            inputs[_model.AUX_FUTURE_PAD_KEY] = np.asarray(data[_model.AUX_FUTURE_PAD_KEY], dtype=bool)
 
         return inputs
 
@@ -174,6 +185,11 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     images_dict = {name: convert_image(img) for name, img in images.items()}
 
     data["images"] = images_dict
+    # Same conversion for the aux future frame, so it is byte-identically preprocessed to the real
+    # cameras. It is NOT in `images` (that dict is validated against EXPECTED_CAMERAS above, and a
+    # fourth entry would raise), so it has to be converted explicitly here.
+    if _model.AUX_FUTURE_IMAGE_KEY in data:
+        data[_model.AUX_FUTURE_IMAGE_KEY] = convert_image(data[_model.AUX_FUTURE_IMAGE_KEY])
     data["state"] = state
     return data
 

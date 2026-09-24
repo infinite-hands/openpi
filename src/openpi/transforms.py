@@ -182,6 +182,40 @@ class Unnormalize(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class SplitFutureFrame(DataTransformFn):
+    """WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md).
+
+    When the loader asks LeRobot for two timestamps of one image column, that column arrives
+    STACKED as (2, C, H, W) instead of the usual (C, H, W). This restores index 0 in place -- so
+    every downstream transform for that key is bit-identical to an aux-disabled run -- and exposes
+    index 1 under its own key.
+
+    Must run in `repack_transforms`, BEFORE the robot-specific input transform: AlohaInputs raises
+    on any camera outside EXPECTED_CAMERAS, and its convert_image is strictly 3-D, so a stacked
+    array reaching it crashes there.
+
+    Also carries LeRobot's companion `<key>_is_pad` for the second timestamp. LeRobot's
+    _get_query_indices clamps with min(episode_end - 1, idx + delta), so within `k` frames of every
+    episode boundary the "future" frame IS the current frame -- an exact copy, roughly
+    k/episode_length of the corpus. Those samples are trivially satisfiable AND depress the
+    copy-baseline diagnostic, so the flag has to reach the loss to be masked rather than averaged in.
+    """
+
+    raw_key: str
+    future_key: str
+    pad_key: str
+
+    def __call__(self, data: DataDict) -> DataDict:
+        stacked = data[self.raw_key]
+        data[self.raw_key] = stacked[0]
+        data[self.future_key] = stacked[1]
+        is_pad = data.get(f"{self.raw_key}_is_pad")
+        # False when absent: a dataset that never pads has no clamped samples to mask.
+        data[self.pad_key] = np.asarray(is_pad)[1] if is_pad is not None else np.False_
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class ResizeImages(DataTransformFn):
     height: int
     width: int
