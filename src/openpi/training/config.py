@@ -490,6 +490,23 @@ class TrainConfig:
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
 
+    # --- WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md) ---
+    # 0.0 disables it entirely, and every code path it touches is then byte-identical to a build
+    # without the feature. Declared here rather than per-config so they are settable per run as
+    # tyro flags (--aux-loss-weight=0.05) with no fork edit per experiment.
+    aux_loss_weight: float = 0.0
+    # Frames ahead the loss predicts. Must be < model.action_horizon: it also selects the action
+    # window that conditions the predictor, and past the horizon those actions do not exist.
+    # Too small is a silent failure -- at k=8 (0.27s at 30Hz) the task is nearly trivial; JEPA-WAM
+    # uses 31 on LIBERO and 50 on RoboTwin. Watch aux_copy_baseline to tell.
+    aux_loss_offset_k: int = 29
+    # The aux predictor's own Adam learning rate; it has its own optimizer, separate from the
+    # schedule above, because it is not part of the model's trainable_filter.
+    aux_learning_rate: float = 1e-3
+    # Decay for the aux loss's OWN EMA target encoder. Deliberately not `ema_decay` above -- see
+    # the comment on TrainState for why reusing that would change what checkpoints export.
+    aux_ema_decay: float = 0.999
+
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
@@ -555,6 +572,14 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.aux_loss_weight > 0 and not (0 < self.aux_loss_offset_k < self.model.action_horizon):
+            # Fails here rather than mid-training: aux_loss_offset_k also slices the action window
+            # that conditions the predictor, and past the action horizon those actions do not exist.
+            raise ValueError(
+                f"aux_loss_offset_k ({self.aux_loss_offset_k}) must be strictly between 0 and "
+                f"model.action_horizon ({self.model.action_horizon}); it selects both the future "
+                "frame offset and the conditioning action window."
+            )
 
 
 # Use `get_config` if you need to get a config by name in your code.

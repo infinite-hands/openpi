@@ -78,6 +78,14 @@ IMAGE_RESOLUTION = (224, 224)
 #   s = state dimension
 #   l = sequence length
 #
+# WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). The future frame rides inside
+# the "image" dict under this private key purely so ResizeImages -- which resizes every entry in
+# that dict generically -- resizes it exactly like a real camera. Observation.from_dict pops it
+# back out before `images` is read, so it never reaches embed_prefix.
+AUX_FUTURE_IMAGE_KEY = "__aux_future_right_wrist_0_rgb"
+AUX_FUTURE_PAD_KEY = "aux_future_is_pad"
+
+
 @at.typecheck
 @struct.dataclass
 class Observation(Generic[ArrayT]):
@@ -106,6 +114,17 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). A frame `aux_loss_offset_k`
+    # steps ahead of the current one, used ONLY as a prediction target during training and never as
+    # part of what the model perceives as "now". Deliberately a field of its own rather than a
+    # fourth entry in `images`: `embed_prefix` iterates `images` directly, so anything placed there
+    # would be fed to the model as a real camera. `preprocess_observation` also rebuilds Observation
+    # without this field, so it cannot leak into the primary forward pass by that route either.
+    future_image: at.Float[ArrayT, "*b h w c"] | None = None
+    # True for samples where LeRobot clamped the future index at an episode boundary, so
+    # `future_image` is really the current frame. Masked out of the aux loss.
+    future_is_pad: at.Bool[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -118,10 +137,16 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        # Popped AFTER the uint8 -> [-1, 1] loop above, so the future frame gets exactly the same
+        # normalization as a real camera for free, and BEFORE `images` is read below, so it never
+        # reaches embed_prefix as a fourth camera.
+        future_image = data["image"].pop(AUX_FUTURE_IMAGE_KEY, None)
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            future_image=future_image,
+            future_is_pad=data.get(AUX_FUTURE_PAD_KEY),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -133,6 +158,14 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        # Round-trip the aux fields back to where from_dict expects them, and drop them entirely
+        # when unset so callers that splat this dict (e.g. FakeDataset) do not gain None entries.
+        future_image = result.pop("future_image", None)
+        future_is_pad = result.pop("future_is_pad", None)
+        if future_image is not None:
+            result["image"][AUX_FUTURE_IMAGE_KEY] = future_image
+        if future_is_pad is not None:
+            result[AUX_FUTURE_PAD_KEY] = future_is_pad
         return result
 
 

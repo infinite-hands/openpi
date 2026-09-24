@@ -22,6 +22,25 @@ class TrainState:
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
 
+    # --- WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md) ---
+    # All default to None, so a config that does not enable the aux loss produces a TrainState
+    # structurally identical to before these fields existed.
+    #
+    # `aux_ema_params` is DELIBERATELY separate from `ema_params` above rather than reusing it.
+    # The aux loss needs an EMA copy of the model to act as its target encoder, and every IH YAM
+    # config sets `ema_decay=None`, so the obvious move is to switch openpi's own EMA on. That
+    # would be a silent deployment change: `checkpoints.py`'s `_split_params` exports `ema_params`
+    # AS the inference "params" item whenever it is non-None, so enabling it would change which
+    # weights every downstream serve, validate and warm-start loads, with no error and no log line.
+    # Keeping a separate copy leaves `_split_params` untouched, and lets the aux decay be tuned
+    # independently of checkpoint quality -- they want different values anyway.
+    aux_ema_decay: float | None = struct.field(pytree_node=False, default=None)
+    aux_ema_params: nnx.State | None = None
+    # The aux predictor's own parameters, its own optax state, and the small EMA-lagged projection
+    # it needs -- all bundled by wam_aux and kept entirely out of the model's `trainable_filter`,
+    # so pi0's own optimizer state and checkpoint contents are unchanged.
+    aux: Any | None = None
+
 
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:

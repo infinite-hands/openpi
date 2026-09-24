@@ -27,6 +27,7 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
+import openpi.training.wam_aux as wam_aux
 import openpi.training.weight_loaders as _weight_loaders
 
 
@@ -105,6 +106,21 @@ def init_train_state(
         # Convert frozen params to bfloat16.
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
+        # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). Entirely absent unless
+        # enabled: `aux=None` makes the TrainState pytree structurally identical to before this
+        # feature existed, and train_step's branch on it is resolved at trace time.
+        aux = None
+        aux_ema_params = None
+        if config.aux_loss_weight > 0:
+            aux = wam_aux.init_aux_state(
+                action_dim=config.model.action_dim,
+                learning_rate=config.aux_learning_rate,
+                rngs=nnx.Rngs(jax.random.fold_in(rng, 0x4157)),
+            )
+            # Seeded from the initial params, and kept separate from `ema_params` so that enabling
+            # this loss cannot change what a checkpoint exports for inference.
+            aux_ema_params = params
+
         return training_utils.TrainState(
             step=0,
             params=params,
@@ -113,6 +129,9 @@ def init_train_state(
             opt_state=tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
+            aux_ema_decay=config.aux_ema_decay,
+            aux_ema_params=aux_ema_params,
+            aux=aux,
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
@@ -135,6 +154,153 @@ def init_train_state(
     return train_state, state_sharding
 
 
+# The Observation.images key, NOT the LeRobot column name: AlohaInputs maps the raw
+# "cam_right_wrist" column to this. The aux loss targets the right wrist specifically because it is
+# the view that sees the part being grasped.
+AUX_CAMERA_KEY = "right_wrist_0_rgb"
+
+
+def _minimal_observation(image: at.Array, reference: _model.Observation) -> _model.Observation:
+    """A single-camera Observation for the aux path.
+
+    `embed_prefix` iterates `obs.images` and never reads `obs.state`, so one camera in gives
+    exactly that camera's tokens out, with no language branch (tokenized_prompt stays None) and
+    nothing to slice. `state` is reused from the real batch purely because the field is required.
+    """
+    if AUX_CAMERA_KEY not in reference.images:
+        # Fail rather than falling back to some other camera: silently targeting the base view
+        # instead of the wrist would still train, still look healthy, and be measuring the wrong
+        # thing entirely.
+        raise ValueError(
+            f"the aux loss targets {AUX_CAMERA_KEY!r}, which this config's observation does not "
+            f"have (got {sorted(reference.images)}). A config without a right-wrist camera cannot "
+            "use this loss as written."
+        )
+    return _model.Observation(
+        images={AUX_CAMERA_KEY: image},
+        image_masks={AUX_CAMERA_KEY: reference.image_masks[AUX_CAMERA_KEY]},
+        state=reference.state,
+    )
+
+
+def _train_step_with_aux(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    model: _model.BaseModel,
+    train_rng: at.KeyArrayLike,
+    observation: _model.Observation,
+    actions: _model.Actions,
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """`train_step` with the WAM auxiliary loss added. Differentiates one combined loss w.r.t. BOTH
+    the backbone (filtered by trainable_filter, exactly as the stock path does) and the aux
+    predictor's own parameters, then steps each with its own optimizer."""
+    if observation.future_image is None:
+        raise ValueError(
+            "aux_loss_weight > 0 but the batch carries no future_image -- the data config did not "
+            "request the extra frame. See create_torch_dataset's delta_timestamps and "
+            "SplitFutureFrame in the data config."
+        )
+    aux = state.aux
+    projection = nnx.merge(aux.projection_graphdef, aux.projection_params)
+    predictor = nnx.merge(aux.predictor_graphdef, aux.predictor_params)
+
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel,
+        projection: wam_aux.AuxProjection,
+        predictor: wam_aux.AuxFuturePredictor,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+    ):
+        primary_rng, aux_rng = jax.random.split(rng)
+        primary_loss = jnp.mean(model.compute_loss(primary_rng, observation, actions, train=True))
+
+        context_tokens, _, _ = model.embed_prefix(_minimal_observation(observation.images[AUX_CAMERA_KEY], observation))
+        # The target encoder: an EMA copy of the whole model, kept SEPARATE from openpi's own
+        # ema_params so enabling this cannot change which weights a checkpoint exports (see
+        # TrainState). It is not part of the diffed argnums, so it is detached by construction.
+        target_model = nnx.merge(state.model_def, state.aux_ema_params)
+        target_tokens, _, _ = target_model.embed_prefix(
+            _minimal_observation(observation.future_image, observation)
+        )
+
+        per_example, per_copy, collapse = wam_aux.compute_aux_loss(
+            projection,
+            predictor,
+            aux.projection_ema,
+            aux_rng,
+            context_tokens=context_tokens,
+            target_tokens_raw=target_tokens,
+            offset_k=config.aux_loss_offset_k,
+            action_window=actions[:, : config.aux_loss_offset_k, :],
+            is_pad=observation.future_is_pad,
+        )
+        aux_loss = jnp.mean(per_example)
+        total = primary_loss + config.aux_loss_weight * aux_loss
+        return total, (primary_loss, aux_loss, jnp.mean(per_copy), collapse)
+
+    argnums = (
+        nnx.DiffState(0, config.trainable_filter),
+        nnx.DiffState(1, nnx.All(nnx.Param)),
+        nnx.DiffState(2, nnx.All(nnx.Param)),
+    )
+    (loss, (primary_loss, aux_loss, copy_baseline, collapse)), (grads, grads_proj, grads_pred) = (
+        nnx.value_and_grad(loss_fn, argnums=argnums, has_aux=True)(
+            model, projection, predictor, train_rng, observation, actions
+        )
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(
+        state,
+        step=state.step + 1,
+        params=new_params,
+        opt_state=new_opt_state,
+        aux=wam_aux.apply_aux_update(aux, grads_proj, grads_pred),
+        aux_ema_params=jax.tree.map(
+            lambda old, new: state.aux_ema_decay * old + (1 - state.aux_ema_decay) * new,
+            state.aux_ema_params,
+            new_params,
+        ),
+    )
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+            ),
+        )
+
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        "loss": loss,
+        "primary_loss": primary_loss,
+        "aux_loss": aux_loss,
+        # What "the future just looks like the present" already scores. aux_loss meaningfully below
+        # this is the only evidence the predictor beats the identity map.
+        "aux_copy_baseline": copy_baseline,
+        # 0 = target directions well spread, 1 = collapsed to one (the degenerate solution where
+        # the representation stops encoding change so present and future match trivially).
+        "aux_collapse": collapse,
+        "grad_norm": optax.global_norm(grads),
+        "param_norm": optax.global_norm(kernel_params),
+    }
+    return new_state, info
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -154,6 +320,12 @@ def train_step(
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
+
+    # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). `state.aux is None` is part
+    # of the pytree STRUCTURE, so this branch is resolved statically at trace time -- an aux-off run
+    # traces exactly the code below and nothing else.
+    if state.aux is not None:
+        return _train_step_with_aux(config, state, model, train_rng, observation, actions)
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
