@@ -112,6 +112,24 @@ def init_train_state(
         aux = None
         aux_ema_params = None
         if config.aux_loss_weight > 0:
+            # The aux loss exists to shape the VISION TOWER, and it reaches it only through
+            # embed_prefix -> PaliGemma.img. If the config's freeze_filter covers those params, the
+            # gradient is filtered out at the optimizer and the loss trains its own predictor while
+            # changing nothing about the model -- a silent no-op that still produces a healthy
+            # looking curve. Note LoRA alone does NOT cause this: get_freeze_filter freezes
+            # `.*llm.*`, and the vision tower is a sibling at `PaliGemma.img.*`. But a config that
+            # freezes everything except its adapters (e.g. pi05_yam_part_adapt) does.
+            trainable_vision = params.filter(
+                nnx.All(config.trainable_filter, nnx_utils.PathRegex(".*img.*"))
+            ).flat_state()
+            if not trainable_vision:
+                raise ValueError(
+                    "aux_loss_weight > 0 but no PaliGemma.img (vision tower) parameter is "
+                    "trainable under this config's freeze_filter, so the auxiliary loss could not "
+                    "affect the model at all. Use a config whose vision tower trains (e.g. "
+                    "pi05_yam_part_adapt_full or a standard_config one) rather than one that "
+                    "freezes everything but its adapters."
+                )
             aux = wam_aux.init_aux_state(
                 action_dim=config.model.action_dim,
                 learning_rate=config.aux_learning_rate,
