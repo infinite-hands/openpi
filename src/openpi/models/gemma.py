@@ -384,8 +384,8 @@ class Block(nn.Module):
         if pool_mask is not None and xs[0] is not None:
             pooled = _masked_mean(xs[0], pool_mask)
             if feature_control is not None:
-                steer = _feature_steer(pooled, feature_control)
-                xs = [xs[0] + steer[:, None, :].astype(xs[0].dtype), *xs[1:]]
+                steer = _token_steer(_feature_steer(pooled, feature_control), pool_mask, feature_control)
+                xs = [xs[0] + steer.astype(xs[0].dtype), *xs[1:]]
 
         layer_outputs = (kv_cache, attention_summary) if collect_attention else kv_cache
         if pool_mask is not None:
@@ -473,7 +473,8 @@ class Module(nn.Module):
         per-layer rows `direction` (depth, width), `offset`, `lower`, `upper` and `active` (depth,):
         at each active layer the pooled read `direction . pooled + offset` is moved to its nearest
         point in [lower, upper] by the minimum-norm shift added to every token (arXiv 2603.05487,
-        eq. 7). The returned pools are read before that layer's shift."""
+        eq. 7). An optional `token_mask` (depth, b, t) confines the shift to those tokens, scaled so
+        the pooled read still lands on the band. The returned pools are read before that layer's shift."""
         if feature_control is not None and pool_mask is None:
             raise ValueError("feature_control needs pool_mask")
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -567,6 +568,16 @@ def _feature_steer(pooled, control):
     # An inactive layer's direction is all zeros; the floor keeps its unused branch finite.
     gain = (target - reading) / jnp.maximum(jnp.sum(direction * direction), 1e-12)
     return jnp.where(control["active"], gain, 0.0)[:, None] * direction[None, :]
+
+
+def _token_steer(shift, pool_mask, control):
+    """(b, t, width) per-token shift. Without `token_mask` every token gets `shift`; with it only the
+    masked pooled tokens do, scaled so the pooled mean still moves by exactly `shift`."""
+    if "token_mask" not in control:
+        return jnp.broadcast_to(shift[:, None, :], (*pool_mask.shape, shift.shape[-1]))
+    selected = (control["token_mask"] & pool_mask).astype(jnp.float32)
+    scale = jnp.sum(pool_mask, axis=1, keepdims=True) / jnp.maximum(jnp.sum(selected, axis=1, keepdims=True), 1.0)
+    return shift[:, None, :] * (selected * scale)[..., None]
 
 
 def _gated_residual(x, y, gate):
