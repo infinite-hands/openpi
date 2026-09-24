@@ -329,6 +329,7 @@ class Block(nn.Module):
         attention_key_count: int | None = None,
         pool_mask=None,
         feature_control=None,
+        pool_expert: int = 0,
     ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
@@ -381,11 +382,13 @@ class Block(nn.Module):
         xs = sharding.activation_sharding_constraint(xs)
 
         pooled = None
-        if pool_mask is not None and xs[0] is not None:
-            pooled = _masked_mean(xs[0], pool_mask)
+        if pool_mask is not None and xs[pool_expert] is not None:
+            stream = xs[pool_expert]
+            pooled = _masked_mean(stream, pool_mask)
             if feature_control is not None:
                 steer = _token_steer(_feature_steer(pooled, feature_control), pool_mask, feature_control)
-                xs = [xs[0] + steer.astype(xs[0].dtype), *xs[1:]]
+                xs = list(xs)
+                xs[pool_expert] = stream + steer.astype(stream.dtype)
 
         layer_outputs = (kv_cache, attention_summary) if collect_attention else kv_cache
         if pool_mask is not None:
@@ -419,7 +422,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(6, 7, 9),  # self is index 0; these flags control Python branches and slices.
+            static_argnums=(6, 7, 9, 12),  # self is index 0; these flags control Python branches and slices.
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -437,8 +440,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 0,
+                nn.broadcast,
             ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices, key count,
-            # pool mask, per-layer feature control
+            # pool mask, per-layer feature control, pooled expert
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -467,14 +471,16 @@ class Module(nn.Module):
         attention_key_count: int | None = None,
         pool_mask: at.Bool[at.Array, "b t"] | None = None,
         feature_control: dict | None = None,
+        pool_expert: int = 0,
     ) -> tuple:
-        """`pool_mask` returns, last, every layer's first-expert residual stream mean-pooled over the
-        masked tokens, (depth, b, width) float32. `feature_control` (needs `pool_mask`) holds
+        """`pool_mask` returns, last, every layer's residual stream of expert `pool_expert` (0: the
+        prefix, 1: the action expert) mean-pooled over the masked tokens, (depth, b, width) float32. `feature_control` (needs `pool_mask`) holds
         per-layer rows `direction` (depth, width), `offset`, `lower`, `upper` and `active` (depth,):
         at each active layer the pooled read `direction . pooled + offset` is moved to its nearest
         point in [lower, upper] by the minimum-norm shift added to every token (arXiv 2603.05487,
-        eq. 7). An optional `token_mask` (depth, b, t) confines the shift to those tokens, scaled so
-        the pooled read still lands on the band. The returned pools are read before that layer's shift."""
+        eq. 7). A `shift` row (depth, b) replaces the band: the read moves by exactly that much,
+        whatever it was. An optional `token_mask` (depth, b, t) confines the shift to those tokens,
+        scaled so the pooled read still moves by the same amount. The returned pools are read before that layer's shift."""
         if feature_control is not None and pool_mask is None:
             raise ValueError("feature_control needs pool_mask")
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -494,6 +500,7 @@ class Module(nn.Module):
             attention_key_count,
             pool_mask,
             feature_control,
+            pool_expert,
         )
         embedded, layer_outputs = layer_result
         pooled_by_layer = None
@@ -563,10 +570,13 @@ def _masked_mean(x, mask):
 
 def _feature_steer(pooled, control):
     direction = control["direction"].astype(jnp.float32)
-    reading = pooled @ direction + control["offset"]
-    target = jnp.clip(reading, control["lower"], control["upper"])
+    if "shift" in control:
+        change = control["shift"]
+    else:
+        reading = pooled @ direction + control["offset"]
+        change = jnp.clip(reading, control["lower"], control["upper"]) - reading
     # An inactive layer's direction is all zeros; the floor keeps its unused branch finite.
-    gain = (target - reading) / jnp.maximum(jnp.sum(direction * direction), 1e-12)
+    gain = change / jnp.maximum(jnp.sum(direction * direction), 1e-12)
     return jnp.where(control["active"], gain, 0.0)[:, None] * direction[None, :]
 
 
