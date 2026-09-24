@@ -327,6 +327,8 @@ class Block(nn.Module):
         collect_attention=False,  # noqa: FBT002
         attention_query_indices=None,
         attention_key_count: int | None = None,
+        pool_mask=None,
+        feature_control=None,
     ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
@@ -378,9 +380,17 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        if collect_attention:
-            return xs, (kv_cache, attention_summary)
-        return xs, kv_cache
+        pooled = None
+        if pool_mask is not None and xs[0] is not None:
+            pooled = _masked_mean(xs[0], pool_mask)
+            if feature_control is not None:
+                steer = _feature_steer(pooled, feature_control)
+                xs = [xs[0] + steer[:, None, :].astype(xs[0].dtype), *xs[1:]]
+
+        layer_outputs = (kv_cache, attention_summary) if collect_attention else kv_cache
+        if pool_mask is not None:
+            return xs, (layer_outputs, pooled)
+        return xs, layer_outputs
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -425,7 +435,10 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices, key count
+                nn.broadcast,
+                0,
+            ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices, key count,
+            # pool mask, per-layer feature control
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -452,7 +465,17 @@ class Module(nn.Module):
         collect_attention: bool = False,
         attention_query_indices: at.Int[at.Array, "b selected_queries"] | None = None,
         attention_key_count: int | None = None,
+        pool_mask: at.Bool[at.Array, "b t"] | None = None,
+        feature_control: dict | None = None,
     ) -> tuple:
+        """`pool_mask` returns, last, every layer's first-expert residual stream mean-pooled over the
+        masked tokens, (depth, b, width) float32. `feature_control` (needs `pool_mask`) holds
+        per-layer rows `direction` (depth, width), `offset`, `lower`, `upper` and `active` (depth,):
+        at each active layer the pooled read `direction . pooled + offset` is moved to its nearest
+        point in [lower, upper] by the minimum-norm shift added to every token (arXiv 2603.05487,
+        eq. 7). The returned pools are read before that layer's shift."""
+        if feature_control is not None and pool_mask is None:
+            raise ValueError("feature_control needs pool_mask")
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
@@ -468,20 +491,29 @@ class Module(nn.Module):
             collect_attention,
             attention_query_indices,
             attention_key_count,
+            pool_mask,
+            feature_control,
         )
+        embedded, layer_outputs = layer_result
+        pooled_by_layer = None
+        if pool_mask is not None:
+            layer_outputs, pooled_by_layer = layer_outputs
         if collect_attention:
-            embedded, (kv_cache, attention_by_layer) = layer_result
+            kv_cache, attention_by_layer = layer_outputs
         else:
-            embedded, kv_cache = layer_result
+            kv_cache = layer_outputs
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
         outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ]
+        result = (outputs, kv_cache)
         if collect_attention:
-            return outputs, kv_cache, attention_by_layer
-        return outputs, kv_cache
+            result = (*result, attention_by_layer)
+        if pool_mask is not None:
+            result = (*result, pooled_by_layer)
+        return result
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
@@ -521,6 +553,20 @@ def _name(name, i):
     if i == 0:
         return name
     return f"{name}_{i}"
+
+
+def _masked_mean(x, mask):
+    weights = mask.astype(jnp.float32)[..., None]
+    return jnp.sum(x.astype(jnp.float32) * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1.0)
+
+
+def _feature_steer(pooled, control):
+    direction = control["direction"].astype(jnp.float32)
+    reading = pooled @ direction + control["offset"]
+    target = jnp.clip(reading, control["lower"], control["upper"])
+    # An inactive layer's direction is all zeros; the floor keeps its unused branch finite.
+    gain = (target - reading) / jnp.maximum(jnp.sum(direction * direction), 1e-12)
+    return jnp.where(control["active"], gain, 0.0)[:, None] * direction[None, :]
 
 
 def _gated_residual(x, y, gate):
