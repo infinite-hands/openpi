@@ -205,6 +205,47 @@ def _minimal_observation(image: at.Array, reference: _model.Observation) -> _mod
     )
 
 
+def _vision_grad_share(grads_primary, grads_aux, weight: float) -> dict[str, at.Array]:
+    """How big the (weighted) aux gradient is next to the primary one, inside the vision tower.
+
+    Leaves are matched by path; the two gradient trees share one structure because both come from
+    the same DiffState over the same model. Per-layer numbers use SigLIP's scan-stacked layout, where
+    every `encoderblock` leaf carries the layer on axis 0.
+    """
+    primary_leaves, _ = jax.tree_util.tree_flatten_with_path(grads_primary)
+    aux_leaves = jax.tree.leaves(grads_aux)
+    primary_sq = aux_sq = dot = 0.0
+    aux_dominant = count = 0.0
+    primary_layer_sq = aux_layer_sq = 0.0
+    for (path, p), a in zip(primary_leaves, aux_leaves, strict=True):
+        key = jax.tree_util.keystr(path)
+        if "img" not in key:
+            continue
+        p = p.astype(jnp.float32)
+        a = weight * a.astype(jnp.float32)
+        primary_sq += jnp.sum(p * p)
+        aux_sq += jnp.sum(a * a)
+        dot += jnp.sum(p * a)
+        aux_dominant += jnp.sum(jnp.abs(a) > jnp.abs(p))
+        count += p.size
+        if "encoderblock" in key:
+            primary_layer_sq += jnp.sum(jnp.square(p.reshape(p.shape[0], -1)), axis=1)
+            aux_layer_sq += jnp.sum(jnp.square(a.reshape(a.shape[0], -1)), axis=1)
+    primary_norm, aux_norm = jnp.sqrt(primary_sq), jnp.sqrt(aux_sq)
+    layer_ratio = jnp.sqrt(aux_layer_sq / (primary_layer_sq + 1e-30))
+    depth = layer_ratio.shape[0]
+    return {
+        "gshare_img_primary_norm": primary_norm,
+        "gshare_img_aux_norm": aux_norm,  # already multiplied by aux_loss_weight
+        "gshare_img_aux_over_primary": aux_norm / (primary_norm + 1e-30),
+        "gshare_img_cos": dot / (primary_norm * aux_norm + 1e-30),
+        "gshare_img_aux_dominant_frac": aux_dominant / count,
+        "gshare_img_ratio_layer_first": layer_ratio[0],
+        "gshare_img_ratio_layer_mid": layer_ratio[depth // 2],
+        "gshare_img_ratio_layer_last": layer_ratio[depth - 1],
+    }
+
+
 def _train_step_with_aux(
     config: _config.TrainConfig,
     state: training_utils.TrainState,
@@ -267,11 +308,36 @@ def _train_step_with_aux(
         nnx.DiffState(1, nnx.All(nnx.Param)),
         nnx.DiffState(2, nnx.All(nnx.Param)),
     )
-    (loss, (primary_loss, aux_loss, copy_baseline, collapse)), (grads, grads_proj, grads_pred) = (
-        nnx.value_and_grad(loss_fn, argnums=argnums, has_aux=True)(
+    grad_share_info = {}
+    if config.aux_log_grad_share:
+        # Same loss, split in two so each term's gradient can be measured before they are summed.
+        # Each returns only its own term, so jit can drop the other term's forward computation.
+        def primary_only(model, projection, predictor, rng, observation, actions):
+            _, parts = loss_fn(model, projection, predictor, rng, observation, actions)
+            return parts[0]
+
+        def aux_only(model, projection, predictor, rng, observation, actions):
+            _, parts = loss_fn(model, projection, predictor, rng, observation, actions)
+            return parts[1], (parts[2], parts[3])
+
+        primary_loss, (grads_primary, _, _) = nnx.value_and_grad(primary_only, argnums=argnums)(
             model, projection, predictor, train_rng, observation, actions
         )
-    )
+        (aux_loss, (copy_baseline, collapse)), (grads_aux, grads_proj, grads_pred) = nnx.value_and_grad(
+            aux_only, argnums=argnums, has_aux=True
+        )(model, projection, predictor, train_rng, observation, actions)
+        weight = config.aux_loss_weight
+        grads = jax.tree.map(lambda p, a: p + weight * a, grads_primary, grads_aux)
+        grads_proj = jax.tree.map(lambda g: weight * g, grads_proj)
+        grads_pred = jax.tree.map(lambda g: weight * g, grads_pred)
+        loss = primary_loss + weight * aux_loss
+        grad_share_info = _vision_grad_share(grads_primary, grads_aux, weight)
+    else:
+        (loss, (primary_loss, aux_loss, copy_baseline, collapse)), (grads, grads_proj, grads_pred) = (
+            nnx.value_and_grad(loss_fn, argnums=argnums, has_aux=True)(
+                model, projection, predictor, train_rng, observation, actions
+            )
+        )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -319,6 +385,7 @@ def _train_step_with_aux(
         "aux_collapse": collapse,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **grad_share_info,
     }
     return new_state, info
 

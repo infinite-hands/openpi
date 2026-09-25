@@ -524,6 +524,10 @@ class TrainConfig:
     # the loss then cannot change the model. That no-op is exactly what the "can the predictor
     # solve it alone" control needs, so this lets one named config opt out of the refusal.
     aux_allow_frozen_vision: bool = False
+    # DIAGNOSTIC ONLY. Computes the primary and aux gradients in two backward passes instead of
+    # one, and logs how large the aux share is inside the vision tower. The update is their sum,
+    # which by linearity is the same gradient the single combined pass produces.
+    aux_log_grad_share: bool = False
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
