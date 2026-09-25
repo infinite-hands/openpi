@@ -520,6 +520,10 @@ class TrainConfig:
     # Decay for the aux loss's OWN EMA target encoder. Deliberately not `ema_decay` above -- see
     # the comment on TrainState for why reusing that would change what checkpoints export.
     aux_ema_decay: float = 0.999
+    # DIAGNOSTIC ONLY. train.py refuses to run the aux loss when the vision tower is frozen, since
+    # the loss then cannot change the model. That no-op is exactly what the "can the predictor
+    # solve it alone" control needs, so this lets one named config opt out of the refusal.
+    aux_allow_frozen_vision: bool = False
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)

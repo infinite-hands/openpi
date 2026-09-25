@@ -187,6 +187,32 @@ def get_ih_yam_configs():
             aux_loss_weight=0.05,
             aux_loss_offset_k=WAM_AUX_OFFSET_K,
         ),
+        # DIAGNOSTIC control for pi05_yam_part_adapt_full_wam: identical, except the vision tower is
+        # frozen, so the aux loss can train only its own predictor. If aux_loss still reaches the
+        # treatment run's level, the loss never needed the backbone to change.
+        TrainConfig(
+            name="pi05_yam_part_adapt_full_wam_frozenimg",
+            model=part_model,
+            data=data_config(
+                PART_ADAPT_REPO_ID, bagging_prompt, assets=part_assets, aux_future_k=WAM_AUX_OFFSET_K
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(PART_ADAPT_PARAMS),
+            batch_size=64,
+            num_train_steps=PART_ADAPT_STEPS,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=50,
+                peak_lr=5e-6,
+                decay_steps=PART_ADAPT_STEPS,
+                decay_lr=5e-7,
+            ),
+            save_interval=200,
+            keep_period=PART_ADAPT_STEPS,
+            freeze_filter=nnx.Any(part_model.get_freeze_filter(), nnx_utils.PathRegex(".*img.*")),
+            ema_decay=None,
+            aux_loss_weight=0.05,
+            aux_loss_offset_k=WAM_AUX_OFFSET_K,
+            aux_allow_frozen_vision=True,
+        ),
         # Historical checkpoints use this name; new full runs use pi05_yam_bagging.
         standard_config("pi05_yam_bagging_three", "local/yam_bagging_three", bagging_prompt),
     ]

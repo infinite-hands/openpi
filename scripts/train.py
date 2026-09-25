@@ -125,7 +125,7 @@ def init_train_state(
             trainable_vision = params.filter(
                 nnx.All(config.trainable_filter, nnx_utils.PathRegex(".*img.*"))
             ).flat_state()
-            if not trainable_vision:
+            if not trainable_vision and not config.aux_allow_frozen_vision:
                 raise ValueError(
                     "aux_loss_weight > 0 but no PaliGemma.img (vision tower) parameter is "
                     "trainable under this config's freeze_filter, so the auxiliary loss could not "
