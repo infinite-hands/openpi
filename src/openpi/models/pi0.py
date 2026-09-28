@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -42,6 +43,72 @@ def make_attn_mask(input_mask, mask_ar):
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
     return jnp.logical_and(attn_mask, valid_mask)
+
+
+# Which block may attend to which, for the sequence [obs | Fp | Fs | act]: obs = images + language,
+# Fp = prefix future tokens, Fs = suffix future tokens, act = action tokens. Rows are queries.
+_OBS, _FP, _FS, _ACT = range(4)
+_FUTURE_RULES_TRAIN_ONLY = np.array(
+    [
+        [1, 0, 0, 0],  # obs never reads a future token, so the prefix is what inference computes
+        [1, 1, 0, 0],  # Fp reads the observation and itself
+        [1, 0, 1, 1],  # Fs reads the observation, itself and the noisy actions, not Fp
+        [1, 0, 0, 1],  # act reads exactly what the stock model's actions read
+    ],
+    dtype=bool,
+)
+_FUTURE_RULES_VISIBLE = np.array(
+    [
+        [1, 0, 0, 0],
+        [1, 1, 0, 0],
+        [1, 1, 1, 1],
+        [1, 1, 1, 1],  # actions also read both future-token blocks
+    ],
+    dtype=bool,
+)
+
+
+def make_future_attn_mask_and_positions(
+    prefix_mask: at.Bool[at.Array, "b p"], n_fp: int, n_fs: int, n_act: int, *, visible: bool
+) -> tuple[at.Bool[at.Array, "b t t"], at.Int[at.Array, "b t"]]:
+    """Attention mask and RoPE positions for [obs | Fp | Fs | act] (pi05 only).
+
+    make_attn_mask cannot express train_only mode, where later blocks must NOT see earlier ones
+    (actions may not read Fp). Positions advance only on valid tokens. In train_only mode, action
+    positions are exactly the stock model's, so the action pathway attends the same keys at the
+    same positions as without future tokens. In visible mode, mask and positions equal
+    make_attn_mask(valid, ar) and cumsum(valid) - 1 over the whole sequence.
+    """
+    rules = _FUTURE_RULES_VISIBLE if visible else _FUTURE_RULES_TRAIN_ONLY
+    block = np.array([_OBS] * prefix_mask.shape[1] + [_FP] * n_fp + [_FS] * n_fs + [_ACT] * n_act)
+    pattern = rules[block[:, None], block[None, :]]
+    batch = prefix_mask.shape[0]
+    valid = jnp.concatenate([prefix_mask, jnp.ones((batch, n_fp + n_fs + n_act), dtype=jnp.bool_)], axis=1)
+    mask = jnp.logical_and(pattern[None], valid[:, None, :] * valid[:, :, None])
+
+    obs_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+    n_valid = jnp.sum(prefix_mask, axis=1, keepdims=True)
+    fp_positions = n_valid + jnp.arange(n_fp)[None]
+    if visible:
+        fs_positions = n_valid + n_fp + jnp.arange(n_fs)[None]
+        act_positions = n_valid + n_fp + n_fs + jnp.arange(n_act)[None]
+    else:
+        fs_positions = n_valid + n_act + jnp.arange(n_fs)[None]
+        act_positions = n_valid + jnp.arange(n_act)[None]
+    positions = jnp.concatenate([obs_positions, fp_positions, fs_positions, act_positions], axis=1)
+    return mask, positions
+
+
+class _FutureHead(nnx.Module):
+    """Per-token MLP from a future token's final hidden state to the target embedding."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, rngs: nnx.Rngs):
+        self.fc_in = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
+        # Not zero-initialised: the loss is a cosine, which is undefined for a zero prediction.
+        self.fc_out = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+
+    def __call__(self, x: at.Array) -> at.Array:
+        return self.fc_out(nnx.gelu(self.fc_in(x.astype(jnp.float32))))
 
 
 @at.typecheck
@@ -98,6 +165,28 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # WAM future tokens. Created last so the RNG stream, and therefore every existing
+        # parameter's init, is identical to the stock model. Names start with `future_` and avoid
+        # `img` / `llm` / `lora`: those regexes drive freezing, the weight loader and diagnostics.
+        self.future_mode = config.future_tokens
+        self.num_future_tokens = config.num_future_tokens
+        if config.future_tokens != "off":
+            init = nnx.initializers.normal(0.02)
+            n = config.num_future_tokens
+            # Content-free queries (I-/V-JEPA): one shared vector plus a per-position embedding, so
+            # the tokens know nothing about the image until they read it through attention.
+            self.future_prefix_shared = nnx.Param(init(rngs.params(), (1, 1, paligemma_config.width)))
+            self.future_prefix_pos = nnx.Param(init(rngs.params(), (1, n, paligemma_config.width)))
+            self.future_suffix_shared = nnx.Param(init(rngs.params(), (1, 1, action_expert_config.width)))
+            self.future_suffix_pos = nnx.Param(init(rngs.params(), (1, n, action_expert_config.width)))
+            # Targets are SigLIP tokens, which PaliGemma.img already projects to the VLM width.
+            self.future_prefix_head = _FutureHead(
+                paligemma_config.width, config.future_head_hidden, paligemma_config.width, rngs
+            )
+            self.future_suffix_head = _FutureHead(
+                action_expert_config.width, config.future_head_hidden, paligemma_config.width, rngs
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -189,6 +278,7 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        self._refuse_visible_future_tokens()
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -213,6 +303,62 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def compute_loss_with_future(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], at.Float[at.Array, "b n d"], at.Float[at.Array, "b n d"], at.Float[at.Array, " b"]]:
+        """compute_loss plus the future tokens' predictions, from ONE forward pass.
+
+        Returns (action loss, prefix-token predictions, suffix-token predictions, flow time). The
+        RNG split, preprocessing, noise and time are compute_loss's verbatim, so a same-seed run
+        sees the same batch, noise and augmentation with or without future tokens.
+        """
+        if self.future_mode == "off":
+            raise ValueError("compute_loss_with_future needs a config with future_tokens enabled")
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        prefix_tokens, prefix_mask, _ = self.embed_prefix(observation)
+        suffix_tokens, _, _, adarms_cond = self.embed_suffix(observation, x_t, time)
+        batch, n = prefix_tokens.shape[0], self.num_future_tokens
+        future_prefix = jnp.broadcast_to(
+            self.future_prefix_shared.value + self.future_prefix_pos.value, (batch, n, prefix_tokens.shape[-1])
+        ).astype(prefix_tokens.dtype)
+        future_suffix = jnp.broadcast_to(
+            self.future_suffix_shared.value + self.future_suffix_pos.value, (batch, n, suffix_tokens.shape[-1])
+        ).astype(suffix_tokens.dtype)
+        attn_mask, positions = make_future_attn_mask_and_positions(
+            prefix_mask, n, n, suffix_tokens.shape[1], visible=self.future_mode == "visible"
+        )
+        # Suffix order [Fs, act] keeps the action readout as the last action_horizon tokens.
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [jnp.concatenate([prefix_tokens, future_prefix], axis=1), jnp.concatenate([future_suffix, suffix_tokens], axis=1)],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+        )
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        prefix_prediction = self.future_prefix_head(prefix_out[:, -n:])
+        suffix_prediction = self.future_suffix_head(suffix_out[:, :n])
+        return action_loss, prefix_prediction, suffix_prediction, time
+
+    def _refuse_visible_future_tokens(self) -> None:
+        # A "visible" model's actions read the future tokens, which the stock compute_loss and
+        # sample_actions never build: they would run, drop the tokens and shift action positions,
+        # and return plausible but wrong actions with no error.
+        if self.future_mode == "visible":
+            raise NotImplementedError(
+                "future_tokens='visible' is training-only for now: sample_actions/compute_loss do not "
+                "build the future tokens this model's actions attend to"
+            )
+
     @override
     def sample_actions(
         self,
@@ -222,6 +368,7 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        self._refuse_visible_future_tokens()
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.

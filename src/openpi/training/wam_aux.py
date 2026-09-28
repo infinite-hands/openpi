@@ -465,3 +465,64 @@ def compute_aux_loss(
     normalized = target * jax.lax.rsqrt(jnp.sum(jnp.square(target), axis=-1, keepdims=True) + 1e-8)
     collapse = jnp.linalg.norm(jnp.mean(normalized, axis=(-3, -2)), axis=-1)
     return per_example, per_example_copy, collapse
+
+
+# --- Future tokens inside the policy (Pi0.compute_loss_with_future) ---
+
+
+def _valid_mean(values: jax.Array, weights: jax.Array) -> jax.Array:
+    """Mean of `values` over entries with nonzero weight; 0 when there are none."""
+    return jnp.sum(values * weights) / jnp.maximum(jnp.sum(weights), 1.0)
+
+
+def future_patch_loss(
+    prediction: jax.Array,
+    target_tokens: jax.Array,
+    current_tokens: jax.Array,
+    *,
+    is_pad: jax.Array | None = None,
+) -> dict[str, jax.Array]:
+    """Patch-wise cosine distance from the future tokens' predictions to the future frame's tokens.
+
+    `target_tokens` and `current_tokens` are the frozen warm-start SigLIP's (batch, patches, dim)
+    outputs for the future and the current right-wrist frame; the caller stops their gradient.
+    Everything is centered (see `_center`) because SigLIP tokens projected to the VLM width sit
+    in a narrow cone where every cosine is close to 1.
+
+    Returns batch-mean scalars over the non-padded examples:
+      loss         the objective (JEPA-WAM's patch-wise 1 - cos)
+      copy         what predicting "the future looks like the present" scores
+      loss_moving  loss on each example's top quartile of patches by copy distance, i.e. where the
+      copy_moving  view actually changes -- a copying solution looks good on `loss` but not here
+      per_example  the per-example loss, for breakdowns such as by flow time
+    """
+    if prediction.shape != target_tokens.shape:
+        raise ValueError(f"prediction {prediction.shape} and target {target_tokens.shape} must match")
+    target = _center(target_tokens)
+    per_patch = 1.0 - _cosine_similarity(_center(prediction), target)
+    copy_patch = 1.0 - _cosine_similarity(_center(current_tokens), target)
+    moving = (copy_patch >= jnp.quantile(copy_patch, 0.75, axis=-1, keepdims=True)).astype(per_patch.dtype)
+
+    per_example = jnp.mean(per_patch, axis=-1)
+    per_example_moving = jnp.sum(per_patch * moving, axis=-1) / jnp.maximum(jnp.sum(moving, axis=-1), 1.0)
+    copy_example = jnp.mean(copy_patch, axis=-1)
+    copy_example_moving = jnp.sum(copy_patch * moving, axis=-1) / jnp.maximum(jnp.sum(moving, axis=-1), 1.0)
+    keep = jnp.ones_like(per_example) if is_pad is None else (~is_pad).astype(per_example.dtype)
+    return {
+        "loss": _valid_mean(per_example, keep),
+        "copy": _valid_mean(copy_example, keep),
+        "loss_moving": _valid_mean(per_example_moving, keep),
+        "copy_moving": _valid_mean(copy_example_moving, keep),
+        "per_example": per_example,
+        "keep": keep,
+    }
+
+
+def loss_by_time_bin(per_example: jax.Array, keep: jax.Array, time: jax.Array) -> dict[str, jax.Array]:
+    """Per-example loss averaged within flow-time bins (t=1 is pure noise, t=0 the clean actions).
+
+    For the suffix tokens, which see the noisy actions: a lower loss at low noise is direct
+    evidence they use the action information rather than only the observation.
+    """
+    bins = {"t_lo": time < 0.3, "t_mid": (time >= 0.3) & (time <= 0.7), "t_hi": time > 0.7}
+    return {name: _valid_mean(per_example, keep * in_bin.astype(keep.dtype)) for name, in_bin in bins.items()}

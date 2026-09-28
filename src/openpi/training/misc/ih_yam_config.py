@@ -1,5 +1,7 @@
 """Infinite Hands YAM training configurations."""
 
+import dataclasses
+
 import flax.nnx as nnx
 
 import openpi.models.pi0_config as pi0_config
@@ -16,6 +18,10 @@ PART_ADAPT_BASE_ASSET = "local/yam_bagging_three"
 PART_ADAPT_BASE_ASSETS_DIR = "/checkpoints/assets/pi05_yam_bagging_three"
 PART_ADAPT_REPO_ID = "local/yam_part_adapt_current"
 PART_ADAPT_STEPS = 800
+# The studio's full-corpus train split of 2026-09-14: 648 teleop + 479 graded inference episodes,
+# 13 parts, recorded 2026-07-10..09-11 -- before any left-only (robot.leader_sides == ["left"]) or
+# mirrored episode existed, so it contains none.
+FULLCORPUS_FIRSTTRY_REPO_ID = "local/yam_fullcorpus_teleop_firsttry_20260914"
 
 
 def _model() -> pi0_config.Pi0Config:
@@ -40,6 +46,8 @@ def get_ih_yam_configs():
     # model.action_horizon, since it also selects the conditioning action window; TrainConfig's
     # __post_init__ enforces that.
     WAM_AUX_OFFSET_K = 29
+    # WAM future tokens predict ~0.5 s ahead (16 frames at 30 fps, FLARE's horizon).
+    WAM_FUTURE_K = 16
     AUX_FUTURE_REPACK_KEY = "aux_future_image"
     AUX_PAD_REPACK_KEY = "aux_future_is_pad_raw"
 
@@ -213,6 +221,42 @@ def get_ih_yam_configs():
             aux_loss_offset_k=WAM_AUX_OFFSET_K,
             aux_allow_frozen_vision=True,
         ),
+        # WAM future tokens: a MECHANISM study of whether a future-prediction loss read from the
+        # policy's own hidden states (FLARE / JEPA-WAM style) needs, and so shapes, the policy.
+        # a: future tokens are training-only -- nothing the actions use reads them.
+        # b: actions also attend to them (FLARE-style); training-only until inference supports it.
+        # c: frozen-policy control on a's mask -- only the future tokens and heads train. If c
+        #    reaches a's future loss, the loss never needed the policy.
+        *[
+            TrainConfig(
+                name=f"pi05_yam_future_{variant}",
+                model=dataclasses.replace(part_model, future_tokens=mode),
+                data=data_config(
+                    FULLCORPUS_FIRSTTRY_REPO_ID, bagging_prompt, assets=part_assets, aux_future_k=WAM_FUTURE_K
+                ),
+                weight_loader=weight_loaders.CheckpointWeightLoader(
+                    PART_ADAPT_PARAMS, missing_regex=".*lora.*|future_.*"
+                ),
+                # Fixed across all runs, sized for the cheapest GPU that fits (see the GPU probe).
+                batch_size=8,
+                num_train_steps=3_000,
+                # openpi's default schedule: 1K warmup to 2.5e-5; with its default 30K decay the LR
+                # stays near peak over these 3K steps.
+                lr_schedule=_optimizer.CosineDecaySchedule(),
+                save_interval=1_000,
+                keep_period=3_000,
+                freeze_filter=freeze,
+                ema_decay=None,
+                future_loss_weight=0.1,
+                future_loss_warmup_steps=1_000,
+                future_grad_diag_interval=100,
+            )
+            for variant, mode, freeze in (
+                ("a", "train_only", part_model.get_freeze_filter()),
+                ("b", "visible", part_model.get_freeze_filter()),
+                ("c", "train_only", nnx.Not(nnx_utils.PathRegex("future_.*"))),
+            )
+        ],
         # Historical checkpoints use this name; new full runs use pi05_yam_bagging.
         standard_config("pi05_yam_bagging_three", "local/yam_bagging_three", bagging_prompt),
     ]

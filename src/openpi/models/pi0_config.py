@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -34,11 +34,23 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # WAM future tokens (see Pi0.compute_loss_with_future). "off" builds exactly the stock model.
+    # "train_only": nothing images, language or actions attend to reads the future tokens, so the
+    # action pathway and inference are unchanged and the tokens act only through shared weights.
+    # "visible": action tokens also attend to them (FLARE-style); not yet supported at inference.
+    future_tokens: Literal["off", "train_only", "visible"] = "off"
+    num_future_tokens: int = 256
+    future_head_hidden: int = 2048
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.future_tokens != "off" and not self.pi05:
+            # The future-token mask treats every suffix token as an action token; pi0's separate
+            # state token would silently gain attention it does not have in the stock model.
+            raise ValueError("future_tokens requires pi05")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

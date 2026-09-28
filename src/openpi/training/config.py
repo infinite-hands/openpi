@@ -529,6 +529,15 @@ class TrainConfig:
     # which by linearity is the same gradient the single combined pass produces.
     aux_log_grad_share: bool = False
 
+    # --- WAM future tokens (model.future_tokens != "off"; see Pi0.compute_loss_with_future) ---
+    # Weight on EACH of the two future-token losses (prefix and suffix), reached by a linear warmup
+    # over future_loss_warmup_steps (JEPA-WAM's pi0.5 setting is 0.1 over the first 1K steps).
+    future_loss_weight: float = 0.0
+    future_loss_warmup_steps: int = 1000
+    # Every this many steps, one extra jitted pass logs the future losses' gradient share of the
+    # primary gradient per parameter group. 0 disables it.
+    future_grad_diag_interval: int = 0
+
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
@@ -602,6 +611,18 @@ class TrainConfig:
                 f"model.action_horizon ({self.model.action_horizon}); it selects both the future "
                 "frame offset and the conditioning action window."
             )
+        if getattr(self.model, "future_tokens", "off") != "off":
+            # Each of these would silently change what the run measures or costs.
+            # FakeDataConfig has no such field and FakeDataset supplies the frame itself.
+            if hasattr(self.data, "aux_future_k") and self.data.aux_future_k is None:
+                raise ValueError("future tokens need the data config to supply a future frame (aux_future_k)")
+            if self.aux_loss_weight > 0:
+                raise ValueError("future tokens replace the old aux loss; set aux_loss_weight=0")
+            if self.ema_decay is not None:
+                raise ValueError(
+                    "future-token configs must set ema_decay=None: openpi's EMA adds a full model copy and "
+                    "makes checkpoints export the EMA weights"
+                )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1012,6 +1033,26 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pi05_future",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            future_tokens="train_only",
+            future_head_hidden=32,
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_pi05_future",
+        wandb_enabled=False,
+        ema_decay=None,
+        future_loss_weight=0.1,
+        future_loss_warmup_steps=5,
+        future_grad_diag_interval=5,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

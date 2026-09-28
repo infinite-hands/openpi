@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -100,6 +101,8 @@ class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
         self._observation_spec, self._action_spec = model_config.inputs_spec()
+        # WAM future-token configs need a future frame, as the real loader supplies via aux_future_k.
+        self._with_future = getattr(model_config, "future_tokens", "off") != "off"
 
     def __getitem__(self, index: SupportsIndex) -> dict:
         rng = jax.random.key(index.__index__())
@@ -117,6 +120,11 @@ class FakeDataset(Dataset):
 
         observation = jax.tree.map(make_from_spec, self._observation_spec)
         action = jax.tree.map(make_from_spec, self._action_spec)
+        if self._with_future:
+            future_image = make_from_spec(next(iter(self._observation_spec.images.values())))
+            observation = dataclasses.replace(
+                observation, future_image=future_image, future_is_pad=jnp.zeros((), dtype=jnp.bool_)
+            )
 
         return {
             **observation.to_dict(),

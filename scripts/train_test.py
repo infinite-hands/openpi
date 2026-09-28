@@ -13,7 +13,7 @@ from openpi.training import config as _config
 from . import train
 
 
-@pytest.mark.parametrize("config_name", ["debug"])
+@pytest.mark.parametrize("config_name", ["debug", "debug_pi05_future"])
 def test_train(
     tmp_path: pathlib.Path,
     config_name: str,

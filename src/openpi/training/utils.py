@@ -41,6 +41,12 @@ class TrainState:
     # so pi0's own optimizer state and checkpoint contents are unchanged.
     aux: Any | None = None
 
+    # --- WAM future tokens (Pi0.compute_loss_with_future) ---
+    # The warm-start vision tower (PaliGemma.img state only, bf16), frozen: the fixed target
+    # encoder for the future-token loss. Only the tower, not the whole model -- about 0.8 GB versus
+    # about 7.8 GB for a full-model copy like `aux_ema_params`. Never updated after init.
+    future_target_img: nnx.State | None = None
+
 
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:

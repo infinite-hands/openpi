@@ -46,12 +46,14 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Params absent from the checkpoint that may be left at their fresh init instead of failing the
+    # pytree check. LoRA by default; the WAM future-token configs add their `future_*` params.
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -143,6 +143,15 @@ def init_train_state(
             # this loss cannot change what a checkpoint exports for inference.
             aux_ema_params = params
 
+        # WAM future tokens: the frozen target encoder is the warm-start vision tower. Taken after
+        # the checkpoint merge above, so it holds the loaded weights, not a fresh init.
+        future_target_img = None
+        if getattr(config.model, "future_tokens", "off") != "off":
+            future_target_img = jax.tree.map(
+                lambda x: x.astype(jnp.bfloat16) if jnp.issubdtype(x.dtype, jnp.floating) else x,
+                nnx.state(model.PaliGemma.img),
+            )
+
         return training_utils.TrainState(
             step=0,
             params=params,
@@ -154,6 +163,7 @@ def init_train_state(
             aux_ema_decay=config.aux_ema_decay,
             aux_ema_params=aux_ema_params,
             aux=aux,
+            future_target_img=future_target_img,
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
@@ -203,6 +213,178 @@ def _minimal_observation(image: at.Array, reference: _model.Observation) -> _mod
         image_masks={AUX_CAMERA_KEY: reference.image_masks[AUX_CAMERA_KEY]},
         state=reference.state,
     )
+
+
+def _future_targets(
+    state: training_utils.TrainState, model: _model.BaseModel, observation: _model.Observation
+) -> tuple[at.Array, at.Array]:
+    """The frozen warm-start tower's tokens for the future and the current right-wrist frame.
+
+    Both frames are the loader's raw 224x224 images, before preprocess_observation, so neither is
+    augmented. One tower pass over both halves of a concatenated batch.
+    """
+    if observation.future_image is None:
+        raise ValueError("future tokens need a future frame in the batch; the data config did not request one")
+    if AUX_CAMERA_KEY not in observation.images:
+        raise ValueError(f"the future-token target is {AUX_CAMERA_KEY!r}, absent from {sorted(observation.images)}")
+    graphdef, _ = nnx.split(model.PaliGemma.img)
+    target_tower = nnx.merge(graphdef, state.future_target_img)
+    frames = jnp.concatenate([observation.future_image, observation.images[AUX_CAMERA_KEY]], axis=0)
+    tokens, _ = target_tower(frames, train=False)
+    future, current = jnp.split(jax.lax.stop_gradient(tokens.astype(jnp.float32)), 2, axis=0)
+    return future, current
+
+
+def _future_weight(config: _config.TrainConfig, step: at.Array) -> at.Array:
+    """Per-loss weight, linearly warmed up from 0 to future_loss_weight."""
+    if config.future_loss_warmup_steps <= 0:
+        return jnp.asarray(config.future_loss_weight, jnp.float32)
+    ramp = jnp.minimum(1.0, step.astype(jnp.float32) / config.future_loss_warmup_steps)
+    return config.future_loss_weight * ramp
+
+
+def _future_losses(model, rng, observation, actions, future_target, current_target):
+    action_loss, prefix_prediction, suffix_prediction, time = model.compute_loss_with_future(
+        rng, observation, actions, train=True
+    )
+    prefix = wam_aux.future_patch_loss(
+        prefix_prediction, future_target, current_target, is_pad=observation.future_is_pad
+    )
+    suffix = wam_aux.future_patch_loss(
+        suffix_prediction, future_target, current_target, is_pad=observation.future_is_pad
+    )
+    return jnp.mean(action_loss), prefix, suffix, time
+
+
+def _train_step_with_future(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+    model: _model.BaseModel,
+    train_rng: at.KeyArrayLike,
+    observation: _model.Observation,
+    actions: _model.Actions,
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """train_step for WAM future tokens: the action loss plus two patch-wise future losses, one
+    optimizer. `train_rng` is passed to the model unsplit, exactly as the stock step does, so a
+    same-seed stock run sees the same noise, flow time and augmentation."""
+    future_target, current_target = _future_targets(state, model, observation)
+    weight = _future_weight(config, state.step)
+
+    def loss_fn(model):
+        primary, prefix, suffix, time = _future_losses(
+            model, train_rng, observation, actions, future_target, current_target
+        )
+        total = primary + weight * (prefix["loss"] + suffix["loss"])
+        return total, (primary, prefix, suffix, time)
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    (loss, (primary, prefix, suffix, time)), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    nnx.update(model, new_params)
+    new_state = dataclasses.replace(state, step=state.step + 1, params=nnx.state(model), opt_state=new_opt_state)
+
+    # How far the live tower has drifted from the frozen warm-start copy, on the same un-augmented
+    # frame: 1.0 at step 0 (a check that the target really is the warm-start tower), and exactly
+    # 1.0 throughout for a frozen-policy control.
+    live_tokens, _ = model.PaliGemma.img(observation.images[AUX_CAMERA_KEY], train=False)
+    live_tokens = jax.lax.stop_gradient(live_tokens.astype(jnp.float32))
+    tower_cos = jnp.mean(wam_aux._cosine_similarity(live_tokens, current_target))
+
+    grad_norm = optax.global_norm(grads)
+    clip = getattr(config.optimizer, "clip_gradient_norm", None)
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        "loss": loss,
+        "primary_loss": primary,
+        "future_weight": weight,
+        "fp_loss": prefix["loss"],
+        "fp_loss_moving": prefix["loss_moving"],
+        "fs_loss": suffix["loss"],
+        "fs_loss_moving": suffix["loss_moving"],
+        # The same targets feed both token sets, so one copy baseline serves both.
+        "future_copy": prefix["copy"],
+        "future_copy_moving": prefix["copy_moving"],
+        "future_valid_frac": jnp.mean(prefix["keep"]),
+        **{f"fs_{name}": value for name, value in wam_aux.loss_by_time_bin(suffix["per_example"], suffix["keep"], time).items()},
+        "tower_vs_warmstart_cos": tower_cos,
+        "grad_norm": grad_norm,
+        "grad_norm_future": optax.global_norm(grads.filter(nnx_utils.PathRegex("future_.*"))),
+        "grad_norm_policy": optax.global_norm(grads.filter(nnx.Not(nnx_utils.PathRegex("future_.*")))),
+        "param_norm": optax.global_norm(kernel_params),
+    }
+    if clip is not None:
+        info["clipped"] = (grad_norm > clip).astype(jnp.float32)
+    return new_state, info
+
+
+def _param_group(key: str) -> str:
+    """Parameter group of a flattened gradient path, for the gradient-share diagnostic."""
+    if "future_" in key:
+        return "future"
+    if "img" in key:
+        return "img"
+    if "llm" in key and "lora" in key:
+        return "ae_lora" if "_1" in key else "vlm_lora"
+    return "other"
+
+
+def future_grad_diagnostics(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    """The weighted future losses' gradient next to the primary gradient, per parameter group.
+
+    A separate jitted pass run every future_grad_diag_interval steps, on the batch the next train
+    step uses, with that step's RNG: two backward passes, so it is kept out of the train step.
+    """
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+    observation, actions = batch
+    train_rng = jax.random.fold_in(rng, state.step)
+    future_target, current_target = _future_targets(state, model, observation)
+    weight = _future_weight(config, state.step)
+
+    def primary_fn(model):
+        return _future_losses(model, train_rng, observation, actions, future_target, current_target)[0]
+
+    def future_fn(model):
+        _, prefix, suffix, _ = _future_losses(model, train_rng, observation, actions, future_target, current_target)
+        return weight * (prefix["loss"] + suffix["loss"])
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    primary_grads = nnx.grad(primary_fn, argnums=diff_state)(model)
+    future_grads = nnx.grad(future_fn, argnums=diff_state)(model)
+    primary_leaves, _ = jax.tree_util.tree_flatten_with_path(primary_grads)
+    future_leaves = jax.tree.leaves(future_grads)
+    sums: dict[str, dict[str, at.Array]] = {}
+    for (path, p), f in zip(primary_leaves, future_leaves, strict=True):
+        group = sums.setdefault(_param_group(jax.tree_util.keystr(path)), {"pp": 0.0, "ff": 0.0, "pf": 0.0})
+        p, f = p.astype(jnp.float32), f.astype(jnp.float32)
+        group["pp"] += jnp.sum(p * p)
+        group["ff"] += jnp.sum(f * f)
+        group["pf"] += jnp.sum(p * f)
+    info = {}
+    for name, group in sums.items():
+        primary_norm, future_norm = jnp.sqrt(group["pp"]), jnp.sqrt(group["ff"])
+        info[f"gdiag_{name}_primary_norm"] = primary_norm
+        info[f"gdiag_{name}_future_norm"] = future_norm
+        info[f"gdiag_{name}_future_over_primary"] = future_norm / (primary_norm + 1e-30)
+        info[f"gdiag_{name}_cos"] = group["pf"] / (primary_norm * future_norm + 1e-30)
+    return info
 
 
 def _vision_grad_share(grads_primary, grads_aux, weight: float) -> dict[str, at.Array]:
@@ -410,6 +592,10 @@ def train_step(
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
+    # WAM future tokens. Like `state.aux` below, part of the pytree structure, so resolved at trace time.
+    if state.future_target_img is not None:
+        return _train_step_with_future(config, state, model, train_rng, observation, actions)
+
     # WAM auxiliary future-prediction loss (see docs/wam_aux_loss.md). `state.aux is None` is part
     # of the pytree STRUCTURE, so this branch is resolved statically at trace time -- an aux-off run
     # traces exactly the code below and nothing else.
@@ -514,6 +700,15 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    grad_diag = None
+    if train_state.future_target_img is not None and config.future_grad_diag_interval > 0:
+        grad_diag = jax.jit(
+            functools.partial(future_grad_diagnostics, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+    pending_diag = {}
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -524,12 +719,24 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        # Before the train step, which donates train_state: measured on the params and batch that
+        # step is about to use.
+        if grad_diag is not None and step % config.future_grad_diag_interval == 0:
+            with sharding.set_mesh(mesh):
+                pending_diag = jax.device_get(grad_diag(train_rng, train_state, batch))
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info.update(pending_diag)
+            pending_diag = {}
+            if train_state.future_target_img is not None:
+                # For sizing research runs onto the cheapest GPU that fits.
+                memory = jax.local_devices()[0].memory_stats() or {}
+                if "peak_bytes_in_use" in memory:
+                    reduced_info["peak_mem_gb"] = memory["peak_bytes_in_use"] / 1e9
             reduced_info["wall_s_per_step"] = (time.monotonic() - interval_started) / len(infos)
             reduced_info["host_data_wait_s_per_step"] = host_data_wait_s / len(infos)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
