@@ -170,6 +170,7 @@ class Attention(nn.Module):
         collect_attention=False,  # noqa: FBT002
         attention_query_indices=None,
         attention_key_count: int | None = None,
+        temporal_memory=None,
     ):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
@@ -208,6 +209,12 @@ class Attention(nn.Module):
                 qkvs.append((q, k, v))
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
+
+        raw_kv = (k, v)
+        if temporal_memory is not None:
+            if kv_cache is not None or collect_attention:
+                raise ValueError("temporal_memory loads into a prefix pass: no kv_cache, no attention capture")
+            k, v = _temporal_memory(k, v, temporal_memory, self.configs[0].head_dim)
 
         q = _apply_rope(q, positions=positions)
         q *= self.configs[0].head_dim ** -0.5
@@ -272,6 +279,8 @@ class Attention(nn.Module):
                 summary = jnp.mean(jnp.take_along_axis(selected_keys, indices, axis=3), axis=(1, 2))
             summary = jax.lax.stop_gradient(summary)
             return out, (k, v), summary
+        if temporal_memory is not None:
+            return out, (k, v), raw_kv
         return out, (k, v)
 
 
@@ -330,6 +339,7 @@ class Block(nn.Module):
         pool_mask=None,
         feature_control=None,
         pool_expert: int = 0,
+        temporal_memory=None,
     ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
@@ -355,6 +365,9 @@ class Block(nn.Module):
                 attention_query_indices=attention_query_indices,
                 attention_key_count=attention_key_count,
             )
+        elif temporal_memory is not None:
+            post_attn, kv_cache, raw_kv = attn(pre_attn, positions, attn_mask, kv_cache,
+                                               temporal_memory=temporal_memory)
         else:
             post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
@@ -391,6 +404,8 @@ class Block(nn.Module):
                 xs[pool_expert] = stream + steer.astype(stream.dtype)
 
         layer_outputs = (kv_cache, attention_summary) if collect_attention else kv_cache
+        if temporal_memory is not None:
+            layer_outputs = (kv_cache, raw_kv)
         if pool_mask is not None:
             return xs, (layer_outputs, pooled)
         return xs, layer_outputs
@@ -441,8 +456,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 0,
                 nn.broadcast,
+                0,
             ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices, key count,
-            # pool mask, per-layer feature control, pooled expert
+            # pool mask, per-layer feature control, pooled expert, per-layer temporal memory
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -472,6 +488,7 @@ class Module(nn.Module):
         pool_mask: at.Bool[at.Array, "b t"] | None = None,
         feature_control: dict | None = None,
         pool_expert: int = 0,
+        temporal_memory: dict | None = None,
     ) -> tuple:
         """`pool_mask` returns, last, every layer's residual stream of expert `pool_expert` (0: the
         prefix, 1: the action expert) mean-pooled over the masked tokens, (depth, b, width) float32. `feature_control` (needs `pool_mask`) holds
@@ -480,7 +497,13 @@ class Module(nn.Module):
         point in [lower, upper] by the minimum-norm shift added to every token (arXiv 2603.05487,
         eq. 7). A `shift` row (depth, b) replaces the band: the read moves by exactly that much,
         whatever it was. An optional `token_mask` (depth, b, t) confines the shift to those tokens,
-        scaled so the pooled read still moves by the same amount. The returned pools are read before that layer's shift."""
+        scaled so the pooled read still moves by the same amount. The returned pools are read before that layer's shift.
+
+        `temporal_memory` (a prefix-only pass) holds per-layer rows `k`, `v` (depth, b, m, kv heads, head dim) of
+        earlier frames' pre-RoPE prefix keys and values, `valid` (depth, b, m), `bias` (depth, b, kv heads, m) and
+        `active` (depth,): at each active layer every prefix key and value takes, as a norm-preserving residual, its
+        softmax K-to-K readout of the valid slots under `bias` (TempoFit, arXiv 2603.07647, eqs. 3-6). It returns,
+        last, this frame's own pre-RoPE prefix keys and values, (depth, b, t, kv heads, head dim) each."""
         if feature_control is not None and pool_mask is None:
             raise ValueError("feature_control needs pool_mask")
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -501,6 +524,7 @@ class Module(nn.Module):
             pool_mask,
             feature_control,
             pool_expert,
+            temporal_memory,
         )
         embedded, layer_outputs = layer_result
         pooled_by_layer = None
@@ -508,6 +532,8 @@ class Module(nn.Module):
             layer_outputs, pooled_by_layer = layer_outputs
         if collect_attention:
             kv_cache, attention_by_layer = layer_outputs
+        elif temporal_memory is not None:
+            kv_cache, memory_kv = layer_outputs
         else:
             kv_cache = layer_outputs
 
@@ -521,6 +547,8 @@ class Module(nn.Module):
             result = (*result, attention_by_layer)
         if pool_mask is not None:
             result = (*result, pooled_by_layer)
+        if temporal_memory is not None:
+            result = (*result, memory_kv)
         return result
 
     def init(self, use_adarms: Sequence[bool]):
@@ -588,6 +616,25 @@ def _token_steer(shift, pool_mask, control):
     selected = (control["token_mask"] & pool_mask).astype(jnp.float32)
     scale = jnp.sum(pool_mask, axis=1, keepdims=True) / jnp.maximum(jnp.sum(selected, axis=1, keepdims=True), 1.0)
     return shift[:, None, :] * (selected * scale)[..., None]
+
+
+def _temporal_memory(k, v, memory, head_dim):
+    """This layer's prefix keys and values with the readout of earlier frames' added, each token's norm
+    kept. A layer that is not `active`, or a row with no valid slot, keeps its own keys and values exactly."""
+    big_neg = -2.3819763e38
+    logits = jnp.einsum("BSKH,BMKH->BKSM", k, memory["k"], preferred_element_type=jnp.float32) * head_dim**-0.5
+    logits = jnp.where(memory["valid"][:, None, None, :], logits + memory["bias"][:, :, None, :], big_neg)
+    weights = jax.nn.softmax(logits, axis=-1)
+    use = memory["active"] & jnp.any(memory["valid"], axis=-1)[:, None, None, None]
+
+    def load(x, history):
+        context = jnp.einsum("BKSM,BMKH->BSKH", weights, history.astype(jnp.float32))
+        mixed = x.astype(jnp.float32) + context
+        own = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
+        mixed = mixed * (own / jnp.maximum(jnp.linalg.norm(mixed, axis=-1, keepdims=True), 1e-6))
+        return jnp.where(use, mixed.astype(x.dtype), x)
+
+    return load(k, memory["k"]), load(v, memory["v"])
 
 
 def _gated_residual(x, y, gate):
