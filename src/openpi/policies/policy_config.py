@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    zero_missing_regex: str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +38,8 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        zero_missing_regex: Passed to `BaseModelConfig.load`: expected leaves missing from the checkpoint whose
+            path fullmatches it are zero-filled (a released base serving a LoRA config). JAX checkpoints only.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -51,10 +54,14 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     if is_pytorch:
+        if zero_missing_regex is not None:
+            raise ValueError("zero_missing_regex is only supported for JAX checkpoints")
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        model = train_config.model.load(
+            _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16), zero_missing_regex=zero_missing_regex
+        )
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure

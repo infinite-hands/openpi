@@ -1,5 +1,7 @@
 from flax import nnx
+from flax import traverse_util
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
@@ -73,6 +75,33 @@ def test_pi0_fast_lora_model():
 
     lora_state_elems = list(model_state.filter(lora_filter))
     assert len(lora_state_elems) > 0
+
+
+def test_load_zero_missing_lora():
+    config = pi0_config.Pi0Config(paligemma_variant="gemma_300m_lora", action_expert_variant="gemma_300m_lora")
+    _, state = nnx.split(config.create(jax.random.key(0)))
+    flat = traverse_util.flatten_dict(state.to_pure_dict(), sep="/")
+    lora_paths = {path for path in flat if "lora" in path}
+    assert lora_paths
+    without_lora = {path: leaf for path, leaf in flat.items() if path not in lora_paths}
+    dtype = next(iter(without_lora.values())).dtype
+
+    with pytest.raises(ValueError):
+        config.load(traverse_util.unflatten_dict(without_lora, sep="/"))
+
+    model = config.load(traverse_util.unflatten_dict(without_lora, sep="/"), zero_missing_regex=".*lora.*")
+    _, loaded = nnx.split(model)
+    loaded_flat = traverse_util.flatten_dict(loaded.to_pure_dict(), sep="/")
+    assert set(loaded_flat) == set(flat)
+    for path in lora_paths:
+        assert loaded_flat[path].shape == flat[path].shape, path
+        assert loaded_flat[path].dtype == dtype, path
+        assert not jnp.any(loaded_flat[path]), path
+
+    non_lora = next(iter(without_lora))
+    also_missing = {path: leaf for path, leaf in without_lora.items() if path != non_lora}
+    with pytest.raises(ValueError):
+        config.load(traverse_util.unflatten_dict(also_missing, sep="/"), zero_missing_regex=".*lora.*")
 
 
 @pytest.mark.manual

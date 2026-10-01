@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import logging
 import pathlib
+import re
 from typing import Generic, TypeVar
 
 import augmax
@@ -230,12 +231,21 @@ class BaseModelConfig(abc.ABC):
     def create(self, rng: at.KeyArrayLike) -> "BaseModel":
         """Create a new model, initializing parameters."""
 
-    def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
-        """Create a model with the given parameters."""
+    def load(
+        self, params: at.Params, *, remove_extra_params: bool = True, zero_missing_regex: str | None = None
+    ) -> "BaseModel":
+        """Create a model with the given parameters.
+
+        `zero_missing_regex` fills every expected leaf absent from `params` whose "/"-joined path fullmatches it
+        with zeros, so a released base checkpoint serves a LoRA config as the untouched base (a zero factor makes
+        the adapter delta exactly zero). Any other missing leaf still fails the equality check.
+        """
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+        if zero_missing_regex is not None:
+            params = _zero_missing_leaves(state.to_pure_dict(), params, zero_missing_regex)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
@@ -257,6 +267,19 @@ class BaseModelConfig(abc.ABC):
     def fake_act(self, batch_size: int = 1) -> Actions:
         _, action_spec = self.inputs_spec(batch_size=batch_size)
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
+
+
+def _zero_missing_leaves(expected: at.Params, params: at.Params, missing_regex: str) -> at.Params:
+    flat_expected = traverse_util.flatten_dict(expected, sep="/")
+    flat_params = traverse_util.flatten_dict(params, sep="/")
+    pattern = re.compile(missing_regex)
+    present = [leaf for leaf in flat_params.values() if hasattr(leaf, "dtype")]
+    # The restored params' dtype (bf16 for a served checkpoint), so the jitted samplers trace one dtype.
+    dtype = present[0].dtype if present else None
+    for path, leaf in flat_expected.items():
+        if path not in flat_params and pattern.fullmatch(path):
+            flat_params[path] = jnp.zeros(leaf.shape, dtype or leaf.dtype)
+    return traverse_util.unflatten_dict(flat_params, sep="/")
 
 
 @dataclasses.dataclass
