@@ -620,21 +620,26 @@ def _token_steer(shift, pool_mask, control):
 
 def _temporal_memory(k, v, memory, head_dim):
     """This layer's prefix keys and values with the readout of earlier frames' added, each token's norm
-    kept. A layer that is not `active`, or a row with no valid slot, keeps its own keys and values exactly."""
-    big_neg = -2.3819763e38
-    logits = jnp.einsum("BSKH,BMKH->BKSM", k, memory["k"], preferred_element_type=jnp.float32) * head_dim**-0.5
-    logits = jnp.where(memory["valid"][:, None, None, :], logits + memory["bias"][:, :, None, :], big_neg)
-    weights = jax.nn.softmax(logits, axis=-1)
-    use = memory["active"] & jnp.any(memory["valid"], axis=-1)[:, None, None, None]
+    kept. A layer that is not `active`, or a row with no valid slot, keeps its own keys and values exactly;
+    an inactive layer skips the readout altogether, so its cost is only the active layers'."""
 
-    def load(x, history):
-        context = jnp.einsum("BKSM,BMKH->BSKH", weights, history.astype(jnp.float32))
-        mixed = x.astype(jnp.float32) + context
-        own = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
-        mixed = mixed * (own / jnp.maximum(jnp.linalg.norm(mixed, axis=-1, keepdims=True), 1e-6))
-        return jnp.where(use, mixed.astype(x.dtype), x)
+    def load_both():
+        big_neg = -2.3819763e38
+        logits = jnp.einsum("BSKH,BMKH->BKSM", k, memory["k"], preferred_element_type=jnp.float32) * head_dim**-0.5
+        logits = jnp.where(memory["valid"][:, None, None, :], logits + memory["bias"][:, :, None, :], big_neg)
+        weights = jax.nn.softmax(logits, axis=-1)
+        use = jnp.any(memory["valid"], axis=-1)[:, None, None, None]
 
-    return load(k, memory["k"]), load(v, memory["v"])
+        def load(x, history):
+            context = jnp.einsum("BKSM,BMKH->BSKH", weights, history.astype(jnp.float32))
+            mixed = x.astype(jnp.float32) + context
+            own = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
+            mixed = mixed * (own / jnp.maximum(jnp.linalg.norm(mixed, axis=-1, keepdims=True), 1e-6))
+            return jnp.where(use, mixed.astype(x.dtype), x)
+
+        return load(k, memory["k"]), load(v, memory["v"])
+
+    return jax.lax.cond(memory["active"], load_both, lambda: (k, v))
 
 
 def _gated_residual(x, y, gate):
