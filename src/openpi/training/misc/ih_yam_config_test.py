@@ -11,6 +11,7 @@ def test_yam_configs_are_registered_with_expected_training_shapes():
         "pi05_yam_part_adapt": ih_yam_config.PART_ADAPT_REPO_ID,
         "pi05_yam_part_adapt_full": ih_yam_config.PART_ADAPT_REPO_ID,
         "pi05_yam_bagging_three": "local/yam_bagging_three",
+        "pi05_yam_bagging_vlash": "local/yam_bagging_three",
     }
 
     for name, repo_id in expected.items():
@@ -19,6 +20,8 @@ def test_yam_configs_are_registered_with_expected_training_shapes():
         assert train_config.model.action_horizon == 30
         assert train_config.batch_size == 64
         assert train_config.ema_decay is None
+        offset = train_config.data.base_config.vlash_max_offset
+        assert offset == (ih_yam_config.VLASH_MAX_OFFSET if name.endswith("_vlash") else 0)
 
     part_adapt = config.get_config("pi05_yam_part_adapt")
     assert part_adapt.num_train_steps == ih_yam_config.PART_ADAPT_STEPS

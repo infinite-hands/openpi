@@ -26,6 +26,51 @@ def test_delta_actions():
     assert np.all(transformed["actions"] == np.array([[3, 2, 5], [5, 4, 7]]))
 
 
+def _offset_item(horizon: int = 4, max_offset: int = 3) -> dict:
+    rows = np.arange(horizon + max_offset, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32)
+    return {"observation.state": np.array([-1.0, -1.0, -1.0], dtype=np.float32), "action": rows}
+
+
+def test_temporal_offset_zero_is_identity():
+    item = _offset_item()
+    transform = _transforms.TemporalOffset(0, 4, ("action",))
+    assert transform(item) is item
+    assert item["action"].shape == (7, 3)
+
+
+def test_temporal_offset_shifts_state_and_actions(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 2)
+    item = _transforms.TemporalOffset(3, 4, ("action",))(_offset_item())
+
+    assert item["action"].shape == (4, 3)
+    assert np.all(item["action"][:, 0] == np.array([2, 3, 4, 5]))
+    assert np.all(item["observation.state"] == np.array([1.0, 1.0, 1.0]))
+
+
+def test_temporal_offset_delta_zero_keeps_measured_state(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 0)
+    item = _transforms.TemporalOffset(3, 4, ("action",))(_offset_item())
+
+    assert np.all(item["action"][:, 0] == np.array([0, 1, 2, 3]))
+    assert np.all(item["observation.state"] == np.array([-1.0, -1.0, -1.0]))
+
+
+def test_temporal_offset_from_recorded_state(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 3)
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    item = _transforms.TemporalOffset(3, 4, ("action",), state_source="state")(item)
+
+    assert np.all(item["action"][:, 0] == np.array([3, 4, 5, 6]))
+    assert np.all(item["observation.state"] == np.array([30.0, 30.0, 30.0]))
+
+
+def test_temporal_offset_needs_the_wider_window():
+    item = _offset_item(horizon=4, max_offset=1)
+    with pytest.raises(ValueError, match="needs 7"):
+        _transforms.TemporalOffset(3, 4, ("action",))(item)
+
+
 def test_delta_actions_noop():
     item = {"state": np.array([1, 2, 3]), "actions": np.array([[3, 4, 5], [5, 6, 7]])}
 

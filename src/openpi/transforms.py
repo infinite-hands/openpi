@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import random
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -179,6 +180,57 @@ class Unnormalize(DataTransformFn):
         if (dim := q01.shape[-1]) < x.shape[-1]:
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+
+
+@dataclasses.dataclass(frozen=True)
+class TemporalOffset(DataTransformFn):
+    """VLASH's temporal-offset augmentation (arXiv 2512.01031): the images stay at frame t while the
+    state and the action window move `delta` frames ahead, `delta` drawn uniformly from 0..max_offset
+    per sample. The deploy loop can then send the state the arm will be at when the chunk starts.
+
+    The dataset must have fetched action_horizon + max_offset action rows. The state at t+delta is
+    the previous commanded action a[t+delta-1] (state_source "action": the reference
+    implementation's proxy, and the one thing the deploy loop knows ahead of time) or the recorded
+    state s[t+delta] (state_source "state", which needs max_offset + 1 fetched state rows). Runs
+    before repack so DeltaActions is relative to the shifted state. A no-op at max_offset 0."""
+
+    max_offset: int
+    action_horizon: int
+    action_keys: Sequence[str]
+    state_key: str = "observation.state"
+    state_source: str = "action"
+
+    def __post_init__(self):
+        if self.max_offset < 0:
+            raise ValueError(f"max_offset must be >= 0, got {self.max_offset}")
+        if self.state_source not in ("action", "state"):
+            raise ValueError(f"state_source must be 'action' or 'state', got {self.state_source!r}")
+        if not self.action_keys:
+            raise ValueError("TemporalOffset needs at least one action key")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.max_offset == 0:
+            return data
+        delta = random.randint(0, self.max_offset)
+        needed = self.action_horizon + self.max_offset
+        first_actions = None
+        for key in self.action_keys:
+            rows = data[key]
+            if rows.shape[0] < needed:
+                raise ValueError(f"{key} has {rows.shape[0]} rows; TemporalOffset needs {needed} "
+                                 f"(action_horizon {self.action_horizon} + max_offset {self.max_offset})")
+            if first_actions is None:
+                first_actions = rows
+            data[key] = rows[delta:delta + self.action_horizon]
+        if self.state_source == "state":
+            states = data[self.state_key]
+            if states.shape[0] < self.max_offset + 1:
+                raise ValueError(f"{self.state_key} has {states.shape[0]} rows; TemporalOffset needs "
+                                 f"{self.max_offset + 1} for state_source 'state'")
+            data[self.state_key] = states[delta]
+        elif delta > 0:
+            data[self.state_key] = first_actions[delta - 1]
+        return data
 
 
 @dataclasses.dataclass(frozen=True)

@@ -88,6 +88,14 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # VLASH temporal-offset augmentation (transforms.TemporalOffset): how many frames ahead of the
+    # images the state and action window may be moved, 0 for none. A checkpoint trained at N lets the
+    # deploy loop ask for a chunk up to N rows ahead of the state it sends.
+    vlash_max_offset: int = 0
+    # Where the shifted state comes from: the previous commanded action ("action") or the recorded
+    # state ("state").
+    vlash_state_source: Literal["action", "state"] = "action"
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 

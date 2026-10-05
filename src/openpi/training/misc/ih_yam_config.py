@@ -15,6 +15,10 @@ PART_ADAPT_BASE_ASSET = "local/yam_bagging_three"
 PART_ADAPT_BASE_ASSETS_DIR = "/checkpoints/assets/pi05_yam_bagging_three"
 PART_ADAPT_REPO_ID = "local/yam_part_adapt_current"
 PART_ADAPT_STEPS = 800
+# VLASH (arXiv 2512.01031) temporal-offset range for the `_vlash` configs. pi0.5 has no fixed call
+# cadence, so this matches the StreamPI i20 recipes (hist_interval 20, offsets up to 19) and one
+# deploy lead policy covers both.
+VLASH_MAX_OFFSET = 19
 
 
 def _model() -> pi0_config.Pi0Config:
@@ -29,13 +33,15 @@ def _model() -> pi0_config.Pi0Config:
 def get_ih_yam_configs():
     # These imports are deferred because config.py expands this function while building its registry.
     from openpi.training.config import AssetsConfig
+    from openpi.training.config import DataConfig
     from openpi.training.config import LeRobotAlohaDataConfig
     from openpi.training.config import TrainConfig
 
-    def data_config(repo_id: str, prompt: str, *, assets: AssetsConfig | None = None):
+    def data_config(repo_id: str, prompt: str, *, assets: AssetsConfig | None = None, vlash_max_offset: int = 0):
         return LeRobotAlohaDataConfig(
             repo_id=repo_id,
             assets=assets or AssetsConfig(),
+            base_config=DataConfig(vlash_max_offset=vlash_max_offset),
             default_prompt=prompt,
             adapt_to_pi=False,
             use_delta_joint_actions=True,
@@ -56,12 +62,12 @@ def get_ih_yam_configs():
             ),
         )
 
-    def standard_config(name: str, repo_id: str, prompt: str):
+    def standard_config(name: str, repo_id: str, prompt: str, *, vlash_max_offset: int = 0):
         model = _model()
         return TrainConfig(
             name=name,
             model=model,
-            data=data_config(repo_id, prompt),
+            data=data_config(repo_id, prompt, vlash_max_offset=vlash_max_offset),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
             batch_size=64,
             num_train_steps=20_000,
@@ -131,4 +137,6 @@ def get_ih_yam_configs():
         ),
         # Historical checkpoints use this name; new full runs use pi05_yam_bagging.
         standard_config("pi05_yam_bagging_three", "local/yam_bagging_three", bagging_prompt),
+        standard_config("pi05_yam_bagging_vlash", "local/yam_bagging_three", bagging_prompt,
+                        vlash_max_offset=VLASH_MAX_OFFSET),
     ]
