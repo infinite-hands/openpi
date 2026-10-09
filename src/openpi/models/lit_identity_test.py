@@ -73,7 +73,7 @@ def test_fixture_matches_the_generator_definition():
     for key in ("seeds", "num_steps", "cases", "config"):
         assert meta[key] == current[key], f"{key} changed since the fixture was generated"
     gemma = meta["gemma"]
-    current_gemma = _gen.gemma_meta()
+    current_gemma = _gen.gemma_meta(git=False)
     for key in ("seed", "shape", "call_paths"):
         assert gemma[key] == current_gemma[key], f"gemma {key} changed since the fixture was generated"
 

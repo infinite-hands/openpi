@@ -336,9 +336,9 @@ def meta(*, git: bool = True) -> dict:
     }
 
 
-def gemma_meta() -> dict:
+def gemma_meta(*, git: bool = True) -> dict:
     return {
-        "git": stock_source_state(),
+        **({"git": stock_source_state()} if git else {}),
         "toolchain": toolchain(),
         "seed": GEMMA_SEED,
         "shape": {"batch": GEMMA_BATCH, "prefix": GEMMA_PREFIX, "suffix": GEMMA_SUFFIX},
