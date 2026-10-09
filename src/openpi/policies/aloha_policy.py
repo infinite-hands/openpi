@@ -84,6 +84,15 @@ class AlohaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # LIT's goal (transforms.SplitLitGoal) is a state: it takes the state's conversion. This transform builds a
+        # fresh dict, so the goal and its mask are forwarded by name or they are dropped here.
+        if transforms.LIT_GOAL_KEY in data:
+            inputs[transforms.LIT_GOAL_KEY] = _decode_state(
+                np.asarray(data[transforms.LIT_GOAL_KEY]), adapt_to_pi=self.adapt_to_pi
+            )
+        if transforms.LIT_GOAL_MASK_KEY in data:
+            inputs[transforms.LIT_GOAL_MASK_KEY] = np.asarray(data[transforms.LIT_GOAL_MASK_KEY])
+
         return inputs
 
 

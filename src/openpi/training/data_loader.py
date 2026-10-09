@@ -18,6 +18,9 @@ import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
 
+# The LeRobot state column every config's repack reads; LIT fetches it at two frames (SplitLitGoal splits them).
+LIT_STATE_KEY = "observation.state"
+
 
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
@@ -138,12 +141,17 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    lit = getattr(model_config, "lit", "off") != "off"
+    if lit:
+        # The goal is the state action_horizon steps ahead, beside the current one (SplitLitGoal).
+        delta_timestamps[LIT_STATE_KEY] = [0.0, action_horizon / dataset_meta.fps]
+    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
+
+    if lit:
+        dataset = TransformedDataset(dataset, [_transforms.SplitLitGoal(LIT_STATE_KEY)])
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -169,6 +177,15 @@ def create_rlds_dataset(
     )
 
 
+def _with_aliases(norm_stats: dict, aliases) -> dict:
+    """`norm_stats` plus each alias key under the statistics of the key it names (DataConfig.norm_aliases)."""
+    if not aliases:
+        return norm_stats
+    if missing := {source for source in aliases.values() if source not in norm_stats}:
+        raise ValueError(f"norm_aliases name statistics the norm stats do not have: {sorted(missing)}.")
+    return {**norm_stats, **{key: norm_stats[source] for key, source in aliases.items()}}
+
+
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
@@ -178,7 +195,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
-        norm_stats = data_config.norm_stats
+        norm_stats = _with_aliases(data_config.norm_stats, data_config.norm_aliases)
 
     return TransformedDataset(
         dataset,
@@ -206,7 +223,7 @@ def transform_iterable_dataset(
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
-        norm_stats = data_config.norm_stats
+        norm_stats = _with_aliases(data_config.norm_stats, data_config.norm_aliases)
 
     return IterableTransformedDataset(
         dataset,
@@ -243,6 +260,8 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if getattr(config.model, "lit", "off") != "off":
+            raise ValueError("lit needs the LeRobot data loader: the RLDS loader does not fetch the goal state.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,

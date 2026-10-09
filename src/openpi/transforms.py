@@ -181,6 +181,57 @@ class Unnormalize(DataTransformFn):
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
+# LIT (latent interface training) goal: the driven arm's state `action_horizon` steps ahead of the sample's frame, and
+# True where that frame exists (False where it was clamped at the end of the episode). Input-only keys: no model output
+# carries them, and they never reach the state or the prompt.
+LIT_GOAL_KEY = "lit_goal"
+LIT_GOAL_MASK_KEY = "lit_goal_mask"
+
+
+def output_norm_stats(norm_stats):
+    """The norm stats `Unnormalize` gets: without the input-only LIT_GOAL_KEY. Unnormalize is strict and no model
+    output carries the goal, so a stats file that held it would fail every serve call."""
+    if norm_stats is None:
+        return None
+    return {key: value for key, value in norm_stats.items() if key != LIT_GOAL_KEY}
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitLitGoal(DataTransformFn):
+    """Splits the two state rows a LIT dataset fetches, [t, t + action_horizon], into the sample's state (row 0, the
+    current frame) and its goal (row 1). The goal is a separate key from here on, so it cannot reach the tokenized
+    state of the prompt. Its mask is True where row 1 is a real frame: LeRobot clamps the query at the end of the
+    episode and flags it in `<state_key>_is_pad`, and a clamped state is not a target. Runs before the repack."""
+
+    state_key: str = "observation.state"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        pad_key = f"{self.state_key}_is_pad"
+        if self.state_key not in data or pad_key not in data:
+            raise ValueError(f"SplitLitGoal needs {self.state_key} and {pad_key}: fetch it at [0, action_horizon].")
+        states, is_pad = np.asarray(data[self.state_key]), np.asarray(data[pad_key])
+        if states.ndim != 2 or states.shape[0] != 2 or is_pad.shape != (2,):
+            raise ValueError(f"expected the state at two frames, (2, dims), got {states.shape} and {is_pad.shape}.")
+        data = {key: value for key, value in data.items() if key != pad_key}
+        data[self.state_key] = states[0]
+        data[LIT_GOAL_KEY] = states[1]
+        data[LIT_GOAL_MASK_KEY] = np.bool_(not is_pad[1])
+        return data
+
+
+def carry_lit_goal(group: Group) -> Group:
+    """`group` with every RepackTransform also passing on the goal and its mask (SplitLitGoal's keys): a repack builds
+    a fresh dict from its structure, so they are dropped there unless it names them."""
+    carried = {LIT_GOAL_KEY: LIT_GOAL_KEY, LIT_GOAL_MASK_KEY: LIT_GOAL_MASK_KEY}
+    return Group(
+        inputs=[
+            dataclasses.replace(t, structure={**t.structure, **carried}) if isinstance(t, RepackTransform) else t
+            for t in group.inputs
+        ],
+        outputs=group.outputs,
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class ResizeImages(DataTransformFn):
     height: int
@@ -332,6 +383,8 @@ class PadStatesAndActions(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        if LIT_GOAL_KEY in data:
+            data[LIT_GOAL_KEY] = pad_to_dim(data[LIT_GOAL_KEY], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
