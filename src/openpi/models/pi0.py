@@ -472,6 +472,8 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        if self.lit != "off":
+            return self._sample_actions_lit(rng, observation, num_steps=num_steps, noise=noise)
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -522,6 +524,54 @@ class Pi0(_model.BaseModel):
 
         def cond(carry):
             x_t, time = carry
+            # robust to floating-point error
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
+    def _check_lit_sampling(self):
+        if self.lit == "stage1":
+            raise ValueError(
+                "lit='stage1' is a training-only configuration (no images, goal K/V); it cannot sample. "
+                "Sample from a lit='stage2' model."
+            )
+        if self.lit == "off":
+            raise ValueError("the LIT sampler is for lit='stage2'; lit='off' samples through the stock path.")
+
+    def _sample_actions_lit(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""],
+        noise: at.Float[at.Array, "b ah ad"] | None,
+    ) -> _model.Actions:
+        """Plain chunk sampling for lit='stage2': the prefix pass and the aggregator run ONCE, the latent K/V are
+        appended to its cache, then every denoising step runs the training loss's `_suffix_velocity` over that cache.
+        There is no memory dict and no RTC: only this plain sampler is LIT-correct."""
+        self._check_lit_sampling()
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        prefix = self._lit_prefix_pass(observation)
+        kv_cache, visible = self._lit_extend_cache(prefix.kv_cache, prefix.visible, prefix.extra)
+        return self._denoise(observation, noise, dt, kv_cache, visible, prefix.offset)
+
+    def _denoise(self, observation, noise, dt, kv_cache, visible, offset):
+        """Euler steps of `dt` (< 0) from `noise` at t=1 to 0 over a finished prefix: `kv_cache` and `visible` already
+        hold the latent columns (see `_suffix_velocity` for the arguments)."""
+        batch_size = noise.shape[0]
+
+        def step(carry):
+            x_t, time = carry
+            v_t = self._suffix_velocity(observation, x_t, jnp.broadcast_to(time, batch_size), kv_cache, visible, offset)
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 

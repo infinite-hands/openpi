@@ -297,11 +297,12 @@ def toolchain() -> dict:
     }
 
 
-def fixture_unavailable_reason() -> str | None:
+def fixture_unavailable_reason(*, needs_siglip: bool = True) -> str | None:
     """Why exact-equality comparison against the fixture is not meaningful here, or None when it is: the fixture is
-    bit-exact only on the toolchain that made it, and only against the real SigLIP (not the opt-in stub encoder). The
-    exact-equality tests skip with this reason, so they read as 'not run', never as passing."""
-    if _utils.stub_image_encoder_enabled():
+    bit-exact only on the toolchain that made it, and (for what runs SigLIP) only against the real SigLIP, not the
+    opt-in stub image encoder. The exact-equality tests skip with this reason, so they read as 'not run', never as
+    passing. `needs_siglip=False` is for the gemma-only fixture, which the stub does not touch."""
+    if needs_siglip and _utils.stub_image_encoder_enabled():
         return (
             f"not run: {_utils.STUB_ENV_VAR} is set, the stub encoder draws different numbers than the fixture's SigLIP"
         )

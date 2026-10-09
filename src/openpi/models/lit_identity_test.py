@@ -28,6 +28,8 @@ from openpi.models.lit_golden import gen_baseline as _gen
 
 _NOT_RUN = _gen.fixture_unavailable_reason()
 exact_equality = pytest.mark.skipif(_NOT_RUN is not None, reason=_NOT_RUN or "")
+_NOT_RUN_GEMMA = _gen.fixture_unavailable_reason(needs_siglip=False)
+exact_equality_gemma = pytest.mark.skipif(_NOT_RUN_GEMMA is not None, reason=_NOT_RUN_GEMMA or "")
 
 
 @functools.cache
@@ -128,7 +130,7 @@ def test_sample_actions_is_bit_identical(case):
         np.testing.assert_array_equal(got[key], want, err_msg=key)
 
 
-@exact_equality
+@exact_equality_gemma
 def test_gemma_call_paths_are_bit_identical():
     """Every pre-existing call path of the scanned gemma.Module (default, prefix-only, over a cache, collect_attention,
     pooling, feature steering, dropout, bfloat16), recomputed on the current gemma.py, equals the fixture bit for bit."""

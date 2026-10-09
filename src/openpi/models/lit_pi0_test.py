@@ -15,7 +15,9 @@ against the stock joint-pass loss differs by a relative 5.0e-8 to 3.0e-7 over rn
 loss against the eager one by 2.0e-7; a mathematically inert parameter (the aggregator's key bias, over which softmax is
 invariant) moves the loss by 2.0e-7. _REL = 1e-5 leaves more than 30x over each. The hard-mask invariances are exactly 0.0,
 and each comes with a power probe: started from the raw valid-token count the same inputs move the velocity by 0.17 to
-0.76 (its scale is 3.1).
+0.76 (its scale is 3.1). Sampling: the eager training velocity and the eager sampling-cache velocity are exactly equal
+(0.0) in float32 and bfloat16; through the compiled sampling loop they differ by 7.6e-8 (float32) and 2.3e-3 (bfloat16: one
+bf16 rounding step is 3.9e-3) relative; the jitted sampler against the eager one by 1.3e-7.
 
 Run the whole file with `-s` to see the measured numbers and the real-dimension parameter counts it prints.
 """
@@ -984,6 +986,54 @@ def test_real_dimension_lit_parameters(capsys):
         )
 
 
+@functools.cache
+def _real_traced(stage: str):
+    """The LIT prefix pass, compute_loss_and_aux and (stage 2) sample_actions traced at real dimensions: ShapeDtypeStructs
+    only, nothing is allocated."""
+    config = _real_config(stage)
+
+    def trace():
+        model = config.create(jax.random.key(0))
+        observation, actions = config.fake_obs(1), config.fake_act(1)
+        out = {
+            "prefix": model._lit_prefix_pass(_pre(observation)),
+            "loss": model.compute_loss_and_aux(jax.random.key(1), observation, actions),
+        }
+        if stage == "stage2":
+            out["actions"] = model.sample_actions(jax.random.key(2), observation, num_steps=2)
+        return out
+
+    return nnx.eval_shape(trace)
+
+
+def test_real_dimension_stage2_loss_and_sampling_trace_with_the_expected_shapes():
+    traced = _real_traced("stage2")
+    prefix, (loss, aux) = traced["prefix"], traced["loss"]
+    layers, s = 18, CAMERAS * IMAGE_TOKENS + 200
+    assert [x.shape for x in prefix.kv_cache] == [(layers, 1, s, 1, 256)] * 2
+    assert prefix.kv_cache[0].dtype == jnp.bfloat16
+    # the stacked per-layer prefix inputs the aggregator reads are (18, 1, 968, 2048); what comes out is K=100 latents
+    assert [x.shape for x in prefix.extra[:2]] == [(layers, 1, 100, 1, 256)] * 2
+    assert prefix.extra[0].dtype == prefix.kv_cache[0].dtype
+    assert prefix.extra[2].shape == (1, 100)
+    assert prefix.latents.shape == (1, 100, 768)
+    assert (prefix.visible.shape, prefix.count.shape, prefix.offset.shape) == ((1, s), (1,), (1,))
+    assert loss.shape == (1, 30)
+    assert sorted(aux) == ["pose_copy_baseline", "pose_loss"]
+    assert all(v.shape == () for v in aux.values())
+    assert traced["actions"].shape == (1, 30, 32)
+
+
+def test_real_dimension_stage1_loss_traces_with_the_expected_shapes():
+    traced = _real_traced("stage1")
+    prefix, (loss, aux) = traced["prefix"], traced["loss"]
+    assert [x.shape for x in prefix.kv_cache] == [(18, 1, 200, 1, 256)] * 2, "the language only: no image columns"
+    assert [x.shape for x in prefix.extra[:2]] == [(18, 1, 8, 1, 256)] * 2, "8 goal tokens"
+    assert prefix.latents is None
+    assert loss.shape == (1, 30)
+    assert sorted(aux) == ["pose_copy_baseline"]
+
+
 def _trainable(config) -> tuple[dict, dict]:
     model = nnx.eval_shape(lambda: config.create(jax.random.key(0)))
     state = nnx.state(model, nnx.Param)
@@ -1141,3 +1191,321 @@ def test_stage1_starts_the_action_rows_from_the_valid_token_count():
     prefix = _prefix("stage1", "base")
     _equal(prefix.offset, prefix.count)
     assert np.asarray(prefix.offset).tolist() == list(TEXT_LENGTHS)
+
+
+# ---- the sampling path: sample_actions ----
+#
+# Sampling observations are the plain ones lit_golden uses (no goal: sampling never reads it), so a lit="off" model and
+# a stage-2 model with the same backbone parameters see exactly the same prefix and can be compared with the stock
+# sampler. openpi has no memory dict and returns the actions only. Each prefix pass runs SigLIP eagerly, hence the caches.
+
+_STEPS = _gen.NUM_STEPS
+_DT = -1.0 / _STEPS
+_SAMPLE_RNG = jax.random.key(_gen.SAMPLE_RNG_SEED)
+_LATENTS = _utils.TINY_LIT_DEFAULTS["lit_num_latents"]
+
+
+def _sample_obs(call: int = 0, **kwargs):
+    return _utils.make_observation(_gen.OBSERVATION_SEEDS[call], **kwargs)
+
+
+def _sample_noise(call: int = 0):
+    return _utils.fixed_noise(_gen.NOISE_SEEDS[call])
+
+
+def _sample(model, observation, noise, *, steps=_STEPS):
+    return model.sample_actions(_SAMPLE_RNG, observation, num_steps=steps, noise=noise)
+
+
+@functools.cache
+def _sampled(call: int):
+    return np.asarray(_sample(_stage_model("stage2")[1], _sample_obs(call), _sample_noise(call)))
+
+
+@functools.cache
+def _sampling_prefix(call: int):
+    """The (extended cache, visible, offset) the sampler builds, from the training path's own pieces."""
+    model = _stage_model("stage2")[1]
+    prefix = model._lit_prefix_pass(_pre(_sample_obs(call)))
+    cache, visible = model._lit_extend_cache(prefix.kv_cache, prefix.visible, prefix.extra)
+    return cache, visible, prefix.offset
+
+
+def _denoise(model, call, cache, visible, offset, observation=None):
+    observation = _pre(_sample_obs(call) if observation is None else observation)
+    return model._denoise(observation, _sample_noise(call), _DT, cache, visible, offset)
+
+
+def _with_latents_of(cache, other):
+    """`cache` with its latent columns (the last _LATENTS) replaced by those of `other`."""
+    return tuple(
+        jnp.concatenate([c[:, :, :-_LATENTS], o[:, :, -_LATENTS:]], axis=2) for c, o in zip(cache, other, strict=True)
+    )
+
+
+@exact_equality
+def test_lit_off_sampling_equals_the_baseline_fixture_and_never_enters_the_lit_path(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("the LIT sampling path ran for lit='off'")
+
+    monkeypatch.setattr(_pi0.Pi0, "_sample_actions_lit", refuse)
+    actions = _gen.run_sample("f32_rand_eager")
+    with np.load(_gen.FIXTURE_DIR / "baseline_actions.npz") as fixture:
+        expected = {k: v for k, v in fixture.items() if k.startswith("f32_rand_eager__")}
+    assert sorted(actions) == sorted(expected) == [_gen.actions_key("f32_rand_eager", i) for i in (1, 2)]
+    for key, want in expected.items():
+        assert actions[key].dtype == want.dtype
+        _equal(actions[key], want)
+
+
+def test_stage1_cannot_sample_and_lit_off_has_no_lit_sampler(stage1):
+    observation = _sample_obs(0)
+    with pytest.raises(ValueError, match="training-only"):
+        stage1.sample_actions(_SAMPLE_RNG, observation)
+    with pytest.raises(ValueError, match="stage2"):
+        _gen.get_model("float32", "rand")._sample_actions_lit(_SAMPLE_RNG, observation, num_steps=2, noise=None)
+
+
+def test_sample_actions_returns_the_actions_only_and_is_the_shared_denoise_over_the_lit_prefix():
+    model = _stage_model("stage2")[1]
+    for call in range(2):
+        actions = _sampled(call)
+        assert actions.shape == (B, _utils.ACTION_HORIZON, ACTION_DIM)
+        assert actions.dtype == np.float32
+        assert np.isfinite(actions).all()
+        cache, visible, offset = _sampling_prefix(call)
+        _equal(_denoise(model, call, cache, visible, offset), actions)
+
+
+def test_the_prefix_pass_and_the_aggregator_run_once_per_sampling_call(monkeypatch):
+    model = _stage_model("stage2")[1]
+    calls = {"prefix": 0, "aggregator": 0}
+    real_prefix, real_aggregator = _pi0.Pi0._lit_prefix_pass, model.lit_aggregator
+
+    def counting_prefix(self, observation):
+        calls["prefix"] += 1
+        return real_prefix(self, observation)
+
+    def counting_aggregator(*args):
+        calls["aggregator"] += 1
+        return real_aggregator(*args)
+
+    monkeypatch.setattr(_pi0.Pi0, "_lit_prefix_pass", counting_prefix)
+    model.lit_aggregator = counting_aggregator
+    try:
+        _sample(model, _sample_obs(0), _sample_noise(0), steps=5)
+    finally:
+        model.lit_aggregator = real_aggregator
+    assert calls == {"prefix": 1, "aggregator": 1}, "five denoising steps, one prefix pass and one set of latents"
+
+
+def test_sampling_noise_comes_from_rng_when_none_is_given():
+    model = _stage_model("stage2")[1]
+    observation = _sample_obs(0)
+    drawn = jax.random.normal(_SAMPLE_RNG, (B, _utils.ACTION_HORIZON, ACTION_DIM))
+    _equal(model.sample_actions(_SAMPLE_RNG, observation, num_steps=_STEPS), _sample(model, observation, drawn))
+
+
+@pytest.mark.parametrize("steps", [1, 2, 7])
+def test_any_number_of_denoising_steps_samples_finite_actions(steps):
+    out = _sample(_stage_model("stage2")[1], _sample_obs(0), _sample_noise(0), steps=steps)
+    assert out.shape == (B, _utils.ACTION_HORIZON, ACTION_DIM)
+    assert bool(jnp.all(jnp.isfinite(out)))
+
+
+def test_the_masks_are_what_separates_stage2_from_the_stock_sampler(stage2):
+    """Both sampled from the same weights: the stock joint prefix reads everything, stage 2 only its latents."""
+    observation, noise = _sample_obs(0), _sample_noise(0)
+    lit = _sample(stage2, observation, noise)
+    stage2.lit = "off"
+    try:
+        stock = _sample(stage2, observation, noise)
+    finally:
+        stage2.lit = "stage2"
+    assert _differs(lit, stock) > 1e-3
+
+
+def test_two_pass_with_no_lit_mask_and_no_latents_equals_the_stock_sampler(stage2, capsys):
+    """Masks off and the latent columns dropped, the two-pass sampler is the stock joint one, on the same weights."""
+    worst = 0.0
+    with _switches(stage2, image=False, language=False):
+        for call in range(2):
+            observation, noise = _sample_obs(call), _sample_noise(call)
+            pre = _pre(observation)
+            prefix = stage2._lit_prefix_pass(pre)
+            two_pass = stage2._denoise(pre, noise, _DT, prefix.kv_cache, prefix.visible, prefix.offset)
+            stage2.lit = "off"
+            try:
+                stock = _sample(stage2, observation, noise)
+            finally:
+                stage2.lit = "stage2"
+            worst = max(worst, _differs(two_pass, stock) / float(np.max(np.abs(stock))))
+    with capsys.disabled():
+        print(f"\nsampling two-pass vs stock sampler: worst relative difference {worst:.3e} (tolerance {_REL})")
+    assert worst <= _REL
+
+
+def _train_velocity(model, observation, x_t, time):
+    prefix = model._lit_prefix_pass(_pre(observation))
+    return model._suffix_velocity(
+        _pre(observation), x_t, time, prefix.kv_cache, prefix.visible, prefix.offset, prefix.extra
+    )
+
+
+def _serve_velocity_eager(model, observation, x_t, time):
+    """The velocity over the cache the sampler builds (latent columns already inside), eagerly."""
+    pre = _pre(observation)
+    prefix = model._lit_prefix_pass(pre)
+    cache, visible = model._lit_extend_cache(prefix.kv_cache, prefix.visible, prefix.extra)
+    return model._suffix_velocity(pre, x_t, time, cache, visible, prefix.offset)
+
+
+def _serve_velocity_sampled(model, observation, noise):
+    """The velocity inside sample_actions, recovered from one Euler step from t=1: x_0 = noise - v(noise, 1)."""
+    return noise - model.sample_actions(_SAMPLE_RNG, observation, num_steps=1, noise=noise)
+
+
+# Measured on this CPU with the real SigLIP (the printed lines): eager train vs eager serve velocity is exactly 0 in
+# both dtypes (they are the same routine over the same cache); the compiled sampling loop differs from the eager
+# training path by float rounding, and in bfloat16 by bf16 rounding (XLA fuses the loop and keeps excess precision).
+# The tolerances are those measurements with headroom: float32 1e-5 over 1.2e-7, bfloat16 2e-2 over 3.0e-3 (one bf16
+# rounding step is 2**-8 = 3.9e-3 of the value).
+_VELOCITY_REL = {"float32": 1e-5, "bfloat16": 2e-2}
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_train_and_serve_compute_the_same_velocity(dtype, capsys):
+    """The velocity of the training path (_lit_prefix_pass + its own latent columns) and of the sampling path (the
+    cache with the latents inside, then the compiled denoising loop), for the same x_t, t and observation."""
+    config = _utils.make_tiny_config(lit="stage2", dtype=dtype)
+    model = _stage_model("stage2")[1] if dtype == "float32" else _stage_model("stage2", dtype="bfloat16")[1]
+    observation = _sample_obs(0, config=config)  # a camera of sample 1 missing, prompts of different lengths
+    noise = _utils.fixed_noise(0, config=config)
+    time = jnp.ones((B,), jnp.float32)  # the sampler's first step: t = 1, x_t = noise
+    train = _train_velocity(model, observation, noise, time)
+    serve_eager = _serve_velocity_eager(model, observation, noise, time)
+    serve = _serve_velocity_sampled(model, observation, noise)
+    scale = float(jnp.max(jnp.abs(train)))
+    eager_gap, sampled_gap = _differs(serve_eager, train) / scale, _differs(serve, train) / scale
+    with capsys.disabled():
+        print(
+            f"\ntrain vs serve velocity ({dtype}): eager {eager_gap:.2e}, through sample_actions {sampled_gap:.2e} "
+            f"relative to {scale:.3e}"
+        )
+    assert eager_gap == 0.0
+    assert sampled_gap <= _VELOCITY_REL[dtype]
+    assert float(jnp.max(jnp.abs(train))) > 0.0
+
+
+def test_train_and_serve_velocities_agree_under_every_valid_token_count_variant():
+    """The offset has to come from the same place in the training pass and the sampling pass (it is one helper): with
+    masked cameras and different prompt lengths per sample, the two velocities still agree exactly."""
+    model = _stage_model("stage2")[1]
+    x_t, time = _x_t_and_time()
+    for name, observation in {"plain": _BASE, **_count_variants(_BASE)}.items():
+        _equal(_serve_velocity_eager(model, observation, x_t, time), _train_velocity(model, observation, x_t, time))
+        print(f"train == serve velocity for {name}")
+
+
+def test_the_training_loss_is_the_sampling_velocity_against_the_target():
+    """End to end: compute_loss, rebuilt from the draws it makes and the SAMPLING path's velocity."""
+    model = _stage_model("stage2")[1]
+    rng = jax.random.key(0)
+    actions = _utils.make_actions(1)
+    noise, time = _utils.training_noise_and_time(rng, B)
+    x_t = time[..., None, None] * noise + (1 - time[..., None, None]) * actions
+    v_t = _serve_velocity_eager(model, _BASE, x_t, time)
+    from_sampling = jnp.mean(jnp.square(v_t - (noise - actions)), axis=-1)
+    loss = model.compute_loss(rng, _BASE, actions)
+    print(f"loss vs sampling-path loss: max |difference| {_differs(loss, from_sampling):.3e}")
+    _equal(loss, from_sampling)
+
+
+def test_hard_mask_sampled_actions_ignore_images_language_and_state():
+    """Latents held fixed (the base observation's), the images, the language/state tokens and the state all change:
+    the sampled actions are bit for bit the same. With live latents the same perturbation moves them."""
+    model = _stage_model("stage2")[1]
+    cache, visible, offset = _sampling_prefix(0)
+    reference = _denoise(model, 0, cache, visible, offset)
+    other_obs = _utils.make_observation(7)
+    other = model._lit_prefix_pass(_pre(other_obs))
+    other_cache, other_visible = model._lit_extend_cache(other.kv_cache, other.visible, other.extra)
+    assert not np.array_equal(np.asarray(other_cache[0][:, :, :-_LATENTS]), np.asarray(cache[0][:, :, :-_LATENTS]))
+    assert not np.array_equal(np.asarray(other_cache[0][:, :, -_LATENTS:]), np.asarray(cache[0][:, :, -_LATENTS:]))
+    _equal(other_visible, visible)
+    _equal(other.offset, offset)
+    fixed = _denoise(model, 0, _with_latents_of(other_cache, cache), other_visible, other.offset, other_obs)
+    _equal(fixed, reference)
+    live = _denoise(model, 0, other_cache, other_visible, other.offset, other_obs)
+    print(f"live latents move the sampled actions by {_differs(live, reference):.3e}")
+    assert _differs(live, reference) > 0.0
+
+
+def test_with_the_masks_off_the_action_rows_do_read_the_prefix(stage2):
+    with _switches(stage2, image=False, language=False):
+        base = stage2._lit_prefix_pass(_pre(_sample_obs(0)))
+        other_obs = _utils.make_observation(7)
+        other = stage2._lit_prefix_pass(_pre(other_obs))
+        extended = stage2._lit_extend_cache
+        cache, visible = extended(base.kv_cache, base.visible, base.extra)
+        other_cache, other_visible = extended(other.kv_cache, other.visible, base.extra)  # the same latents
+        reference = _denoise(stage2, 0, cache, visible, base.offset)
+        moved = _denoise(stage2, 0, other_cache, other_visible, other.offset, other_obs)
+    assert _differs(moved, reference) > 0.0
+
+
+def _sampled_actions(model, observations, noise):
+    return [np.asarray(_sample(model, observation, noise)) for observation in observations]
+
+
+def test_hard_mask_sampled_actions_are_exactly_independent_of_the_valid_token_count(monkeypatch):
+    model = _stage_model("stage2")[1]
+    base_obs, noise = _sample_obs(0), _sample_noise(0)
+    variants = _count_variants(base_obs)
+    with _constant_latents(model):
+        reference = np.asarray(_sample(model, base_obs, noise))
+        for name, observation in variants.items():
+            _equal(_sample(model, observation, noise), reference)
+            print(f"sampled actions exactly equal for: {name}")
+        # the probe has power: with the raw count as the start the same samplers do differ
+        monkeypatch.setattr(_pi0.Pi0, "_lit_suffix_offset", lambda self, count: count)
+        raw_reference = np.asarray(_sample(model, base_obs, noise))
+        leaked = {name: _differs(_sample(model, o, noise), raw_reference) for name, o in variants.items()}
+    print(f"sampling from the raw count would move the actions by {leaked}")
+    assert all(d > 0.0 for d in leaked.values())
+
+
+def test_a_camera_missing_for_the_whole_batch_is_invisible_to_the_sampler():
+    """Single-arm (left_real style): a camera is off for every sample. Its pixels reach neither the latents nor the
+    action rows, even with live latents."""
+    model = _stage_model("stage2")[1]
+    off = tuple(("right_wrist_0_rgb", i) for i in range(B))
+    observation = _sample_obs(0, masked=off)
+    noisy = observation.replace(
+        images={
+            **observation.images,
+            "right_wrist_0_rgb": jnp.asarray(
+                np.random.default_rng(5).uniform(-1, 1, observation.images["right_wrist_0_rgb"].shape), jnp.float32
+            ),
+        }
+    )
+    noise = _sample_noise(0)
+    actions = _sample(model, observation, noise)
+    assert np.isfinite(np.asarray(actions)).all()
+    _equal(_sample(model, noisy, noise), actions)
+
+
+def test_sampling_is_deterministic_under_jit_and_matches_eager(capsys):
+    model = _stage_model("stage2")[1]
+    fn = _utils.jit_sample(model)
+
+    def run():
+        return [np.asarray(fn(_SAMPLE_RNG, _sample_obs(c), num_steps=_STEPS, noise=_sample_noise(c))) for c in range(2)]
+
+    first, second = run(), run()
+    for a, b in zip(first, second, strict=True):
+        _equal(a, b)
+    worst = max(_differs(a, _sampled(c)) / float(np.max(np.abs(_sampled(c)))) for c, a in enumerate(first))
+    with capsys.disabled():
+        print(f"\njit vs eager sampling: worst relative difference {worst:.3e} (tolerance {_REL})")
+    assert worst <= _REL
