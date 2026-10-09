@@ -48,14 +48,14 @@ def stub():
 @pytest.fixture(autouse=True)
 def cold_jax_cache(tmp_path, monkeypatch):
     """No persistent compilation cache for the test: train.main points jax at a cache directory (here a fresh one), and
-    on CPU (jax 0.5.3) an executable of `init_train_state` or of the train step that is read back from it, with its
-    donated buffers, returns corrupted values (a warm start loaded through a weight loader came back as garbage, and a
-    train step segfaulted). Nothing is written to it, so nothing is read from it."""
+    on CPU (jax 0.5.3) an executable of `init_train_state` or of the train step that is read back from it returns
+    different values for the same program (a warm start loaded through a weight loader came back as garbage, and a
+    train step segfaulted), donated buffers included. The cache is switched off, so nothing is written or read."""
     monkeypatch.setenv("OPENPI_JAX_COMPILATION_CACHE_DIR", str(tmp_path / "jax-cache"))
-    previous = jax.config.jax_persistent_cache_min_compile_time_secs
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1e9)
+    previous = jax.config.jax_enable_compilation_cache
+    jax.config.update("jax_enable_compilation_cache", False)
     yield
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", previous)
+    jax.config.update("jax_enable_compilation_cache", previous)
 
 
 def _model_config(stage, **overrides):
@@ -456,10 +456,14 @@ def _step_lines(text) -> list[dict]:
 
 @pytest.mark.parametrize(("stage", "keys"), [("stage1", _STAGE1_KEYS), ("stage2", _STAGE2_KEYS)])
 def test_the_step_line_reaches_the_log_with_every_curve(tmp_path, monkeypatch, caplog, stage, keys):
-    """train.main through the logging module (pbar.write does not reach a non-TTY log): points > 0, all numeric."""
+    """train.main's Step line through the logging module (the pin already logs it there beside pbar.write; nothing was
+    added): points > 0, all numeric, each step once."""
     _run_main(tmp_path, monkeypatch, caplog, _model_config(stage), num_train_steps=3)
     points = _step_lines(caplog.text)
     assert len(points) >= 3, caplog.text[-2000:]
+    # one line per step through logging, as at the pin: a repeated step would be a duplicate point in a metrics tap
+    steps = [p["step"] for p in points]
+    assert steps == sorted(set(steps)), steps
     for point in points:
         assert keys <= set(point) - {"step"}
         assert all(np.isfinite(v) for v in point.values())
@@ -488,9 +492,29 @@ def test_the_pytorch_trainer_refuses_a_lit_config():
             train_pytorch.train_loop(_train_config(_model_config(stage)))
 
 
-def test_the_trainer_scripts_here_are_the_only_ones_that_build_a_loss():
-    """The spec names scripts/train.py and scripts/train_multi_node.py; this fork has no multi-node trainer, and the
-    PyTorch trainer refuses LIT, so train.py is the one place the pose loss has to enter."""
+def test_the_train_script_calls_the_lit_loss_helper_and_nothing_else_builds_a_loss():
+    """Source text, so that a merge cannot take the stage-2 pose-loss guard away unseen: ih/wam-aux-loss,
+    ih/wam-aux-frozen-diag and ih/wam-future-tokens (openpi) rewrite train.py's loss_fn and EMA, and git merges them
+    cleanly. The spec names scripts/train.py and scripts/train_multi_node.py; this fork has no multi-node trainer."""
     scripts = os.path.dirname(os.path.abspath(__file__))
     assert not os.path.exists(os.path.join(scripts, "train_multi_node.py"))
-    assert "loss_with_parts" in open(os.path.join(scripts, "train.py")).read()
+    text = open(os.path.join(scripts, "train.py")).read()
+    assert "return _lit_train.loss_with_parts(model, rng, observation, actions)" in text
+    assert "nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)" in text
+    assert "**_lit_train.lit_info(model, parts, grads)" in text
+    assert "training_utils.ema_update(" in text
+    assert "model.compute_loss(" not in text, "the stock loss call must stay behind loss_with_parts"
+    # the pin's logging, unchanged: one pbar.write and one logging.info of the Step line, never a second logging call
+    assert text.count("pbar.write(") == 1 and text.count('logging.info(f"Step') == 1
+    # the helper is where the guard lives, and it is the only caller of a model's loss outside tests
+    helper = open(os.path.join(os.path.dirname(_lit_train.__file__), "lit_train.py")).read()
+    assert '"pose_loss" not in aux' in helper and "model.lit_pose_weight * aux[" in helper
+    sources = {
+        name: open(os.path.join(scripts, name)).read()
+        for name in sorted(os.listdir(scripts))
+        if name.endswith(".py") and not name.endswith("_test.py")
+    }
+    callers = [name for name, source in sources.items() if ".compute_loss(" in source]
+    assert callers == []
+    # the one other trainer cannot train LIT at all
+    assert "no LIT path" in open(os.path.join(scripts, "train_pytorch.py")).read()
