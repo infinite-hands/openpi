@@ -330,8 +330,15 @@ class Block(nn.Module):
         pool_mask=None,
         feature_control=None,
         pool_expert: int = 0,
+        return_layer_inputs=False,  # noqa: FBT002
+        layer_input_slice: tuple[int, int] | None = None,
     ):
         xs = sharding.activation_sharding_constraint(xs)
+        layer_input = None
+        if return_layer_inputs:
+            assert xs[0] is not None, "the first expert must run to return its layer inputs"
+            start, length = layer_input_slice
+            layer_input = xs[0][:, start : start + length]
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
         attn = Attention(configs=self.configs, name="attn")
@@ -392,7 +399,9 @@ class Block(nn.Module):
 
         layer_outputs = (kv_cache, attention_summary) if collect_attention else kv_cache
         if pool_mask is not None:
-            return xs, (layer_outputs, pooled)
+            layer_outputs = (layer_outputs, pooled)
+        if return_layer_inputs:
+            layer_outputs = (layer_outputs, layer_input)
         return xs, layer_outputs
 
 
@@ -422,7 +431,9 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(6, 7, 9, 12),  # self is index 0; these flags control Python branches and slices.
+            # self is index 0: deterministic, collect_attention, attention_key_count, pool_expert, return_layer_inputs,
+            # layer_input_slice. These flags control Python branches, indexing and slices, so they must stay static.
+            static_argnums=(6, 7, 9, 12, 13, 14),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -441,8 +452,10 @@ class Module(nn.Module):
                 nn.broadcast,
                 0,
                 nn.broadcast,
+                nn.broadcast,
+                nn.broadcast,
             ),  # kv_cache, positions, mask, adarms_cond, deterministic, selected query indices, key count,
-            # pool mask, per-layer feature control, pooled expert
+            # pool mask, per-layer feature control, pooled expert, return_layer_inputs, layer_input_slice
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -472,6 +485,8 @@ class Module(nn.Module):
         pool_mask: at.Bool[at.Array, "b t"] | None = None,
         feature_control: dict | None = None,
         pool_expert: int = 0,
+        return_layer_inputs: bool = False,
+        layer_input_slice: tuple[int, int] | None = None,
     ) -> tuple:
         """`pool_mask` returns, last, every layer's residual stream of expert `pool_expert` (0: the
         prefix, 1: the action expert) mean-pooled over the masked tokens, (depth, b, width) float32. `feature_control` (needs `pool_mask`) holds
@@ -480,13 +495,24 @@ class Module(nn.Module):
         point in [lower, upper] by the minimum-norm shift added to every token (arXiv 2603.05487,
         eq. 7). A `shift` row (depth, b) replaces the band: the read moves by exactly that much,
         whatever it was. An optional `token_mask` (depth, b, t) confines the shift to those tokens,
-        scaled so the pooled read still moves by the same amount. The returned pools are read before that layer's shift."""
+        scaled so the pooled read still moves by the same amount. The returned pools are read before that layer's shift.
+
+        `return_layer_inputs` returns, last, the first expert's input to every layer, stacked (layers, b, length,
+        width), for the `layer_input_slice` = (start, length) tokens of it (default: all of them): what a latent
+        aggregator reads. Both are static. The default call returns exactly what it did before."""
         if feature_control is not None and pool_mask is None:
             raise ValueError("feature_control needs pool_mask")
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
+        if return_layer_inputs:
+            if embedded[0] is None:
+                raise ValueError("return_layer_inputs needs the first expert to run")
+            start, length = (0, embedded[0].shape[1]) if layer_input_slice is None else layer_input_slice
+            if start < 0 or length <= 0 or start + length > embedded[0].shape[1]:
+                raise ValueError(f"layer_input_slice {(start, length)} is outside the {embedded[0].shape[1]} tokens")
+            layer_input_slice = (start, length)
 
         layer_result = self.layers(
             embedded,
@@ -501,8 +527,13 @@ class Module(nn.Module):
             pool_mask,
             feature_control,
             pool_expert,
+            return_layer_inputs,
+            layer_input_slice,
         )
         embedded, layer_outputs = layer_result
+        layer_inputs = None
+        if return_layer_inputs:
+            layer_outputs, layer_inputs = layer_outputs
         pooled_by_layer = None
         if pool_mask is not None:
             layer_outputs, pooled_by_layer = layer_outputs
@@ -521,6 +552,8 @@ class Module(nn.Module):
             result = (*result, attention_by_layer)
         if pool_mask is not None:
             result = (*result, pooled_by_layer)
+        if return_layer_inputs:
+            result = (*result, layer_inputs)
         return result
 
     def init(self, use_adarms: Sequence[bool]):

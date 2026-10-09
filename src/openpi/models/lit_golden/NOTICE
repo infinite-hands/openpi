@@ -1,0 +1,28 @@
+Attribution for the LIT golden-parity fixtures in this directory
+=================================================================
+
+torch_interface.npz holds numbers (weights, inputs and outputs at tiny dimensions) produced by running the PyTorch
+interface classes of the MolmoAct2 LIT fork, which is licensed under the Apache License, Version 2.0:
+
+  _GoalSE3Encoder, _GoalPoseDecoder, _SemanticVisualCrossAttentionBlock, _SemanticVisualSelfAttentionBlock,
+  _SemanticVisualAggregatorGroup, _SemanticVisualAggregator
+  from src/lerobot/policies/molmoact2/modeling_molmoact2.py
+  of https://github.com/jianmanlincjx/lerobot at commit b34a9200c1fc8a6986986ec9252a1197881fabeb
+  (the lerobot submodule of https://github.com/jianmanlincjx/Molmoact2, Apache-2.0; lerobot itself is
+  Copyright 2024 The HuggingFace Inc. team, Apache-2.0).
+  sha256 of the file used: 353172664570e485e59065cd0bf60500dc6312b35c601b9fdd9ab792415c6f65 (also stored in the npz as
+  meta/source_sha256).
+
+The method is from "Breaking the Vision-Action Shortcut: Latent Interface Training for Generalizable Robot Foundation
+Models", code at https://github.com/MAGICLAB-NUS/LIT (Apache-2.0).
+
+gen_torch_fixture.py does not contain or copy that source: it extracts the classes from a local checkout of the file by AST
+at run time. src/openpi/models/lit.py is an independent JAX implementation of the same computation, written from the
+class behaviour and the parameter shapes of the released checkpoints.
+
+torch_pi05_header_shapes.npz holds only tensor names and shapes read from the safetensors headers of the released
+checkpoints https://huggingface.co/linjianman/LIT (pi05/lit_stage1, pi05/lit_stage2), for an informational comparison.
+The pi0.5 plugin (https://github.com/jianmanlincjx/Pi05) carries no licence: it was read as a behavioural reference
+only and none of its code is used here.
+
+Licence text: https://www.apache.org/licenses/LICENSE-2.0

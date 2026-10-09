@@ -1,7 +1,7 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import difflib
 import logging
@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import jax
 from typing_extensions import override
 import tyro
 
@@ -82,6 +83,10 @@ class DataConfig:
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
+    # Keys the data is normalized under another key's statistics: {key: key of the stats}. LIT's goal is a state and
+    # uses the state's. Applied to the data only (data_loader.transform_dataset), never added to `norm_stats`: the
+    # assets saved with a checkpoint stay what compute_norm_stats wrote, and the serve path never sees the key.
+    norm_aliases: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
@@ -186,6 +191,7 @@ class DataConfigFactory(abc.ABC):
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            norm_aliases={_transforms.LIT_GOAL_KEY: "state"} if getattr(model_config, "lit", "off") != "off" else {},
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -270,9 +276,13 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        repack_transforms = self.repack_transforms
+        if getattr(model_config, "lit", "off") != "off":
+            repack_transforms = _transforms.carry_lit_goal(repack_transforms)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
@@ -555,6 +565,26 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if getattr(self.model, "lit", "off") != "off":
+            self._check_lit_freeze_filter()
+
+    def _check_lit_freeze_filter(self) -> None:
+        """A LIT model's freeze filter is part of the method (stage 1 trains the expert and the goal encoder only): a
+        config that selects another set of leaves trains something else, silently (a stage-1 config left at the
+        default `nnx.Nothing` trains every leaf, SigLIP and the backbone included)."""
+        expected = self.model.get_freeze_filter()
+        if self.freeze_filter == expected:
+            return
+        # Not the same filter: compare what they select over the abstract parameters (nothing is allocated).
+        state = nnx.state(nnx.eval_shape(lambda: self.model.create(jax.random.key(0))))
+        have, want = set(state.filter(self.freeze_filter).flat_state()), set(state.filter(expected).flat_state())
+        if have != want:
+            examples = ["/".join(map(str, path)) for path in sorted(have ^ want)[:3]]
+            raise ValueError(
+                f"{self.name}: with lit={self.model.lit!r} the freeze_filter must select the same leaves as "
+                f"model.get_freeze_filter() (set freeze_filter=model.get_freeze_filter()): it freezes {len(have)} "
+                f"leaves and the model's filter {len(want)}; they differ on {len(have ^ want)}, e.g. {examples}."
+            )
 
 
 # Use `get_config` if you need to get a config by name in your code.
