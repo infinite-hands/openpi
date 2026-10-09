@@ -35,6 +35,7 @@ from openpi.training import weight_loaders
 
 from . import lit_train_test as _train_test
 from . import train
+from .lit_train_test import cold_jax_cache  # noqa: F401  (an autouse fixture: no persistent compilation cache)
 
 
 _REAL_SIGLIP = _siglip.Module  # captured before any fixture swaps in the stub

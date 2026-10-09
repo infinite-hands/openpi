@@ -45,6 +45,19 @@ def stub():
         yield
 
 
+@pytest.fixture(autouse=True)
+def cold_jax_cache(tmp_path, monkeypatch):
+    """No persistent compilation cache for the test: train.main points jax at a cache directory (here a fresh one), and
+    on CPU (jax 0.5.3) an executable of `init_train_state` or of the train step that is read back from it, with its
+    donated buffers, returns corrupted values (a warm start loaded through a weight loader came back as garbage, and a
+    train step segfaulted). Nothing is written to it, so nothing is read from it."""
+    monkeypatch.setenv("OPENPI_JAX_COMPILATION_CACHE_DIR", str(tmp_path / "jax-cache"))
+    previous = jax.config.jax_persistent_cache_min_compile_time_secs
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1e9)
+    yield
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", previous)
+
+
 def _model_config(stage, **overrides):
     return _utils.make_tiny_config(lit=stage, **overrides)
 
