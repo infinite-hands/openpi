@@ -314,10 +314,12 @@ def fixture_unavailable_reason(*, needs_siglip: bool = True) -> str | None:
     return None
 
 
-def meta() -> dict:
+def meta(*, git: bool = True) -> dict:
+    """The fixture's metadata. `git=False` leaves out the git state, which needs a checkout (a test that does not
+    compare it must run without one, e.g. in a container that has only the sources)."""
     config = _utils.make_tiny_config()
     return {
-        "git": stock_source_state(),
+        **({"git": stock_source_state()} if git else {}),
         "toolchain": toolchain(),
         "seeds": {
             "model": MODEL_SEED,

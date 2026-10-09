@@ -69,7 +69,7 @@ def test_gemma_fixture_was_generated_from_the_pin():
 
 def test_fixture_matches_the_generator_definition():
     meta = _fixture("baseline_meta.json")
-    current = _gen.meta()
+    current = _gen.meta(git=False)
     for key in ("seeds", "num_steps", "cases", "config"):
         assert meta[key] == current[key], f"{key} changed since the fixture was generated"
     gemma = meta["gemma"]
