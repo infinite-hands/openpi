@@ -1,0 +1,104 @@
+{
+ "cases": {
+  "bf16_rand_eager": {
+   "dtype": "bfloat16",
+   "mode": "eager",
+   "params": "rand"
+  },
+  "f32_rand_eager": {
+   "dtype": "float32",
+   "mode": "eager",
+   "params": "rand"
+  },
+  "f32_rand_jit": {
+   "dtype": "float32",
+   "mode": "jit",
+   "params": "rand"
+  },
+  "f32_raw_eager": {
+   "dtype": "float32",
+   "mode": "eager",
+   "params": "raw"
+  }
+ },
+ "config": {
+  "action_dim": 14,
+  "action_expert_variant": "dummy",
+  "action_horizon": 4,
+  "max_token_len": 8,
+  "paligemma_variant": "dummy",
+  "pi05": true
+ },
+ "gemma": {
+  "call_paths": [
+   "attention_pool_feature",
+   "collect_attention",
+   "collect_attention_selected",
+   "dropout_eval",
+   "dropout_train",
+   "feature_action_expert",
+   "feature_band",
+   "feature_shift_token_mask",
+   "joint",
+   "joint_bf16",
+   "pool_action_expert",
+   "pool_prefix_expert",
+   "prefix_only",
+   "suffix_over_cache"
+  ],
+  "git": {
+   "files_differing_from_pin": [],
+   "head": "fb9a58b29258323611bfcacfc84cf77ab51293a3",
+   "pin": "fb9a58b29258323611bfcacfc84cf77ab51293a3"
+  },
+  "seed": 0,
+  "shape": {
+   "batch": 2,
+   "prefix": 6,
+   "suffix": 3
+  },
+  "toolchain": {
+   "flax": "0.10.2",
+   "jax": "0.5.3",
+   "jax_platform": "cpu",
+   "machine": "arm64",
+   "numpy": "1.26.4",
+   "platform": "macOS-27.0.1-arm64-arm-64bit",
+   "python": "3.11.15"
+  }
+ },
+ "git": {
+  "files_differing_from_pin": [],
+  "head": "fb9a58b29258323611bfcacfc84cf77ab51293a3",
+  "pin": "fb9a58b29258323611bfcacfc84cf77ab51293a3"
+ },
+ "num_steps": 3,
+ "seeds": {
+  "actions": 1,
+  "loss": [
+   0,
+   1,
+   2
+  ],
+  "model": 0,
+  "noise": [
+   0,
+   1
+  ],
+  "observations": [
+   0,
+   1
+  ],
+  "randomize": 0,
+  "sample_rng": 2
+ },
+ "toolchain": {
+  "flax": "0.10.2",
+  "jax": "0.5.3",
+  "jax_platform": "cpu",
+  "machine": "arm64",
+  "numpy": "1.26.4",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "python": "3.11.15"
+ }
+}
