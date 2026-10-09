@@ -69,6 +69,8 @@ IMAGE_RESOLUTION = (224, 224)
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
+#     "lit_goal": float32[*b, s],  # Optional, LIT only: the driven arm's state action_horizon steps ahead
+#     "lit_goal_mask": bool[*b],  # Optional, LIT only: True where lit_goal is a real target, not padding
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -107,12 +109,21 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # LIT (latent interface training) only: the driven arm's state `action_horizon` steps ahead, padded to the state
+    # width and normalised like `state`, and True where it is a real target rather than padding. Never part of `state`
+    # and never tokenized. The two always come together.
+    lit_goal: at.Float[ArrayT, "*b g"] | None = None
+    lit_goal_mask: at.Bool[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        # A goal without its mask would pass zero padding off as a real target.
+        if (data.get("lit_goal") is None) != (data.get("lit_goal_mask") is None):
+            raise ValueError("lit_goal and lit_goal_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -127,6 +138,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            lit_goal=data.get("lit_goal"),
+            lit_goal_mask=data.get("lit_goal_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -206,6 +219,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        lit_goal=observation.lit_goal,
+        lit_goal_mask=observation.lit_goal_mask,
     )
 
 
