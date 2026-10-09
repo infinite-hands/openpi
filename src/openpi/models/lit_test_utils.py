@@ -12,6 +12,7 @@ The public API below is stable; later LIT tests import it unchanged.
     jit_loss(model) / jit_sample(model)                            module_jit wrappers, as Policy uses them
     param_manifest(model) / array_digest(x)                        path -> shape, dtype, sha256 of the values
     stub_image_encoder_enabled()                                   True when the opt-in stub encoder is active
+    stub_image_encoder()                                           context manager: the stub encoder inside it
 
 What the tiny model is. Both Gemma experts use the "dummy" variant (width 64, depth 4, 1 kv head of head_dim 16),
 pi05=True, float32, action_dim 14, action_horizon 4, max_token_len 8. The image tower is the REAL SigLIP So400m/14 by
@@ -136,11 +137,15 @@ class _StubSiglip(nn.Module):
         return tokens, {}
 
 
+def stub_image_encoder():
+    """Context manager: every Pi0 created inside it (build_model, a trainer's init_train_state) gets the stub image
+    tower instead of SigLIP. For tests whose subject is not the image tower (the trainer, the loaders): the tree and
+    the paths differ from a real-SigLIP model's only under `PaliGemma/img`."""
+    return mock.patch.object(_siglip, "Module", _StubSiglip)
+
+
 def build_model(config: _pi0_config.Pi0Config, seed: int = 0):
-    stub = (
-        mock.patch.object(_siglip, "Module", _StubSiglip) if stub_image_encoder_enabled() else contextlib.nullcontext()
-    )
-    with stub:
+    with stub_image_encoder() if stub_image_encoder_enabled() else contextlib.nullcontext():
         return config.create(jax.random.key(seed))
 
 

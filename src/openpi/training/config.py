@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import jax
 from typing_extensions import override
 import tyro
 
@@ -564,6 +565,26 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if getattr(self.model, "lit", "off") != "off":
+            self._check_lit_freeze_filter()
+
+    def _check_lit_freeze_filter(self) -> None:
+        """A LIT model's freeze filter is part of the method (stage 1 trains the expert and the goal encoder only): a
+        config that selects another set of leaves trains something else, silently (a stage-1 config left at the
+        default `nnx.Nothing` trains every leaf, SigLIP and the backbone included)."""
+        expected = self.model.get_freeze_filter()
+        if self.freeze_filter == expected:
+            return
+        # Not the same filter: compare what they select over the abstract parameters (nothing is allocated).
+        state = nnx.state(nnx.eval_shape(lambda: self.model.create(jax.random.key(0))))
+        have, want = set(state.filter(self.freeze_filter).flat_state()), set(state.filter(expected).flat_state())
+        if have != want:
+            examples = ["/".join(map(str, path)) for path in sorted(have ^ want)[:3]]
+            raise ValueError(
+                f"{self.name}: with lit={self.model.lit!r} the freeze_filter must select the same leaves as "
+                f"model.get_freeze_filter() (set freeze_filter=model.get_freeze_filter()): it freezes {len(have)} "
+                f"leaves and the model's filter {len(want)}; they differ on {len(have ^ want)}, e.g. {examples}."
+            )
 
 
 # Use `get_config` if you need to get a config by name in your code.

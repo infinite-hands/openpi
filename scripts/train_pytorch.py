@@ -307,6 +307,10 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    if getattr(config.model, "lit", "off") != "off":
+        raise ValueError(
+            f"{config.name}: lit={config.model.lit!r} trains with scripts/train.py; the PyTorch model has no LIT path."
+        )
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
