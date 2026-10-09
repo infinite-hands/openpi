@@ -18,6 +18,7 @@ from openpi.shared import nnx_utils
 from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 from openpi.training import lit_data_test as _data
+from openpi.training import lit_train as _lit_train
 from openpi.training import weight_loaders
 from openpi.training.misc import ih_yam_config
 
@@ -232,6 +233,25 @@ def test_the_stages_train_what_the_method_says():
 
     full = _config.get_config(STAGE2)
     assert not _selected(full, _abstract(full), "frozen"), "the full fine-tune freezes nothing"
+
+
+def test_every_trainable_leaf_of_every_row_lands_in_a_logged_gradient_norm_module():
+    """The trainer logs grad_norm_<module> per module: at the real dimensions (LoRA included) each trainable leaf maps
+    to exactly one, and the stages report the modules they train."""
+    expected = {
+        CONTROL: {"backbone", "expert"},
+        STAGE1: {"expert", "lit_goal_encoder"},
+        STAGE2: {"backbone", "expert", "lit_aggregator", "lit_pose_decoder"},
+        LITE: {"backbone", "expert", "lit_aggregator", "lit_pose_decoder"},
+    }
+    for name in ROWS:
+        row = _config.get_config(name)
+        modules = set()
+        for path in _selected(row, _abstract(row), "trainable"):
+            key = "/".join(map(str, path))
+            matches = [m for m, pattern in _lit_train._MODULES if pattern.fullmatch(key)]  # noqa: SLF001
+            modules.add(matches[0])
+        assert modules == expected[name], name
 
 
 def test_a_row_with_the_wrong_freeze_filter_is_refused_at_the_real_dimensions():
