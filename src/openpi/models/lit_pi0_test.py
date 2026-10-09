@@ -223,7 +223,9 @@ def test_stage1_refuses_lora_variants():
 
 @dataclasses.dataclass(frozen=True)
 class _WithOtherForkFields(pi0_config.Pi0Config):
-    """The fields other forks and branches add to Pi0Config (see the merge hazards in its comment)."""
+    """The fields other branches add to Pi0Config, spelled and defaulted as the branches have them (the merge hazards
+    in its comment: openpi ih/wam-future-tokens, ih/per-dim-loss-weighting; StreamPI ih/spatial-forcing, ih/vlash,
+    ih/race). No field is invented here: every one is on a real branch."""
 
     future_tokens: str = "off"
     action_dim_weights: tuple[float, ...] | None = None
@@ -231,7 +233,7 @@ class _WithOtherForkFields(pi0_config.Pi0Config):
     vlash_branches: int = 0
     state_cond: bool = False
     image_keys: tuple[str, ...] = _model.IMAGE_KEYS
-    encode_only_active_cameras: bool = False
+    race: bool = False
 
 
 _HAZARDS = {
@@ -241,8 +243,13 @@ _HAZARDS = {
     "vlash_branches": 2,
     "state_cond": True,
     "image_keys": ("base_0_rgb", "left_wrist_0_rgb"),
-    "encode_only_active_cameras": True,
+    "race": True,
 }
+
+
+def test_the_guarded_names_are_the_ones_the_pi0_config_comment_lists():
+    assert {name for name, _ in pi0_config._LIT_INCOMPATIBLE_FIELDS} == set(_HAZARDS)  # noqa: SLF001
+    assert not any(f.name == "encode_only_active_cameras" for f in dataclasses.fields(pi0_config.Pi0Config))
 
 
 @pytest.mark.parametrize("name", sorted(_HAZARDS))
@@ -1369,7 +1376,9 @@ def _serve_velocity_sampled(model, observation, noise):
 # both dtypes (they are the same routine over the same cache); the compiled sampling loop differs from the eager
 # training path by float rounding, and in bfloat16 by bf16 rounding (XLA fuses the loop and keeps excess precision).
 # The tolerances are those measurements with headroom: float32 1e-5 over 1.2e-7, bfloat16 2e-2 over 3.0e-3 (one bf16
-# rounding step is 2**-8 = 3.9e-3 of the value).
+# rounding step is 2**-8 = 3.9e-3 of the value). They are margins around numbers measured on ONE toolchain (arm64 CPU,
+# jax 0.5.3, flax 0.10.2, XLA CPU's fusion choices): another backend fuses and rounds differently (an accelerator keeps
+# other excess precision), so on one the bfloat16 margin is a hypothesis to re-measure, not a bound the code guarantees.
 _VELOCITY_REL = {"float32": 1e-5, "bfloat16": 2e-2}
 
 

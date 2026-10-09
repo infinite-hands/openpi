@@ -15,8 +15,9 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
 
-# (field, its stock value) of the fields other forks add whose loss/prefix/suffix bodies a LIT config would silently
-# bypass or break; the reasons are in the Pi0Config comment. A field the config does not have counts as stock.
+# (field, its stock value) of the fields other branches add whose loss/prefix/suffix bodies a LIT config would silently
+# bypass or break; the reasons and the branch of each are in the Pi0Config comment. A field the config does not have
+# counts as stock, so a guard is inert until its branch is merged: every name here is spelled as that branch spells it.
 _LIT_INCOMPATIBLE_FIELDS = (
     ("future_tokens", "off"),
     ("action_dim_weights", None),
@@ -24,7 +25,7 @@ _LIT_INCOMPATIBLE_FIELDS = (
     ("vlash_branches", 0),
     ("state_cond", False),
     ("image_keys", _model.IMAGE_KEYS),
-    ("encode_only_active_cameras", False),
+    ("race", False),
 )
 
 
@@ -58,17 +59,23 @@ class Pi0Config(_model.BaseModelConfig):
     #   alone does not isolate its modality: image and language tokens attend to each other in the prefix pass, so the
     #   columns left visible carry the hidden modality too.
     # Merge hazards, rejected for lit != "off" because git gives no signal for any of them (the other branch merges
-    # cleanly and the LIT config would then silently train something else). Fields from other forks and branches:
-    #   future_tokens != "off" (ih/wam-future-tokens): moves the loss into compute_loss_with_future, which train.py calls
-    #     when it is set, so a WAM+LIT config would train the future-token loss and never the LIT one.
-    #   action_dim_weights (ih/per-dim-loss-weighting, ih/loss-weighting-vlap): weights the stock loss line, which the
-    #     LIT loss reimplements, so the weights would be dropped without a trace.
+    # cleanly and the LIT config would then silently train something else). Each is a Pi0Config field of a real branch,
+    # under the name and default given here (checked against the branches' pi0_config.py):
+    #   future_tokens != "off" (openpi ih/wam-future-tokens): moves the loss into compute_loss_with_future, which
+    #     train.py calls when it is set, so a WAM+LIT config would train the future-token loss and never the LIT one.
+    #   action_dim_weights (openpi ih/per-dim-loss-weighting, ih/loss-weighting-vlap): weights the stock loss line,
+    #     which the LIT loss reimplements, so the weights would be dropped without a trace.
     #   spatial_layer (StreamPI ih/spatial-forcing): moves the loss body into compute_losses, called when it is set.
-    #   vlash_branches > 0 (ih/vlash): its branch loss replaces the loss body LIT patches.
-    #   state_cond (ih/vlash): adds the state to the adaRMS conditioning in embed_suffix, a direct state path to the
-    #     action rows that breaks the stage-2 premise that they see nothing but the latents.
-    #   non-default image_keys / encode_only_active_cameras (ih/vlash, left-real masking): the model would encode a
-    #     camera subset while prefix_roles reads the layout from obs.images.
+    #   vlash_branches > 0 (StreamPI ih/vlash): its branch loss replaces the loss body LIT patches.
+    #   state_cond (StreamPI ih/vlash, ih/race): adds the state to the adaRMS conditioning in embed_suffix, a direct
+    #     state path to the action rows that breaks the stage-2 premise that they see nothing but the latents.
+    #   non-default image_keys (StreamPI ih/vlash, ih/race): the model would encode a camera subset while prefix_roles
+    #     reads the layout from obs.images. (The recipes' encode_only_active_cameras is a recipe argument that sets
+    #     image_keys, not a field of this config: there is nothing to check under that name.)
+    #   race (StreamPI ih/race): a prior computed from the prefix modulates every adaRMS norm of the action expert,
+    #     another direct path around the latents, and it trains with another loss.
+    # The last five are StreamPI branches and do not exist in this fork: their guards are inert here, kept so that the
+    # two forks reject the same set once a branch is ported.
     lit: Literal["off", "stage1", "stage2"] = "off"
     lit_num_latents: int = 100
     lit_dim: int = 768
