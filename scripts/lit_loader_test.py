@@ -115,18 +115,32 @@ def test_the_trainer_loader_refuses_a_lit_checkpoint_in_a_stock_model_and_every_
         assert "LIT" in str(error.value) and "lit_" in str(error.value) and "silently" in str(error.value)
 
 
-def test_the_opt_in_regex_lets_a_stage2_config_take_a_checkpoint_without_its_lit_modules(tmp_path):
+def test_the_opt_in_regex_lets_a_stage2_config_take_a_checkpoint_without_any_lit_module(tmp_path):
+    """pi05_base has no lit_* leaves (litlite's warm start): the regex lets the model keep its own."""
     shapes = _shapes("stage2")
-    for source in ("off", "stage1"):  # a pi05_base-like stock tree, and a stage-1 checkpoint (goal encoder dropped)
-        path, params = _checkpoint(tmp_path, source)
-        loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
-        loaded = _flat(train._load_weights_and_validate(loader, shapes))
-        assert set(loaded) == {k for k in _flat(shapes) if not k.startswith("lit_")}
-        for key, value in loaded.items():
-            np.testing.assert_array_equal(value, _flat(params)[key])
+    path, params = _checkpoint(tmp_path, "off")
+    loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
+    loaded = _flat(train._load_weights_and_validate(loader, shapes))
+    assert set(loaded) == {k for k in _flat(shapes) if not k.startswith("lit_")}
+    for key, value in loaded.items():
+        np.testing.assert_array_equal(value, _flat(params)[key])
     # the default stays LoRA-only, and the field is a plain dataclass field (the CLI can reach it)
     assert weight_loaders.CheckpointWeightLoader("x").missing_regex == ".*lora.*"
     assert weight_loaders.CheckpointWeightLoader("x") == weight_loaders.CheckpointWeightLoader("x", ".*lora.*")
+
+
+@pytest.mark.parametrize(("source", "target"), [("stage1", "stage2"), ("stage2", "stage1"), ("stage1", "off")])
+def test_the_generic_loader_with_the_lit_regex_refuses_lit_leaves_the_model_lacks(tmp_path, source, target):
+    """The opt-in regex forgives a MISSING lit_* leaf; it must not turn the merge's silent drop of a PRESENT one (the
+    stage-1 goal encoder in a stage-2 model) into a silent hand-off: that is LitStage1WeightLoader's job."""
+    path, _ = _checkpoint(tmp_path, source)
+    loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
+    with pytest.raises(ValueError, match="silently drop"):
+        train._load_weights_and_validate(loader, _shapes(target))
+    stage1_only = source == "stage1" and target == "stage2"
+    if stage1_only:
+        with pytest.raises(ValueError, match="LitStage1WeightLoader"):
+            train._load_weights_and_validate(loader, _shapes(target))
 
 
 def test_the_lit_missing_regex_is_anchored():
@@ -180,6 +194,33 @@ def test_the_handoff_loader_keeps_every_backbone_and_expert_leaf_and_drops_the_g
 def test_the_handoff_loader_without_a_path_says_what_to_pass():
     with pytest.raises(ValueError, match="--weight-loader.params-path"):
         weight_loaders.LitStage1WeightLoader().load(_shapes("stage2"))
+
+
+def test_the_handoff_loader_does_not_drop_a_checkpoint_leaf_the_target_lacks(tmp_path):
+    """Everything in the stage-1 checkpoint is consumed by the stage-2 model or is the goal encoder: a stray leaf (a
+    checkpoint of another architecture) would be dropped by the merge without a word."""
+    path, params = _checkpoint(tmp_path, "stage1")
+    shapes = _shapes("stage2")
+    flat = _flat(params)
+    flat["PaliGemma/llm/layers/not_in_stage2/w"] = np.zeros((2, 2), np.float32)
+    stray_path = tmp_path / "stray" / "params"
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        checkpointer.save(stray_path, {"params": traverse_util.unflatten_dict(flat, sep="/")})
+    with pytest.raises(ValueError, match="not_in_stage2"):
+        weight_loaders.LitStage1WeightLoader(str(stray_path)).load(shapes)
+    # and the honest checkpoint still hands off, goal encoder dropped by design
+    assert weight_loaders.LitStage1WeightLoader(path).load(shapes)
+
+
+@pytest.mark.parametrize("loader_type", [weight_loaders.LitStage1WeightLoader, weight_loaders.CheckpointWeightLoader])
+def test_a_wrong_params_path_says_it_must_end_in_step_params(tmp_path, loader_type):
+    """A step directory or an experiment root is not a params checkpoint: orbax says only that `_METADATA` is missing,
+    after a container has started. The loaders say what the path has to look like."""
+    params_dir, _ = _checkpoint(tmp_path, "stage1")
+    step_dir = os.path.dirname(params_dir)
+    for wrong in (step_dir, str(tmp_path), str(tmp_path / "nothing" / "params")):
+        with pytest.raises(FileNotFoundError, match=r"<step>/params"):
+            loader_type(wrong).load(_shapes("stage2"))
 
 
 @pytest.mark.parametrize("source", ["off", "stage2"])

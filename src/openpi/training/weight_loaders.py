@@ -14,6 +14,18 @@ import openpi.shared.download as download
 logger = logging.getLogger(__name__)
 
 
+def _restore_params(params_path: str) -> at.Params:
+    """The checkpoint's params as numpy arrays. A path that is not a params directory raises an opaque FileNotFoundError
+    for `_METADATA` deep inside orbax, often after a container has started: say what the path has to be."""
+    try:
+        return _model.restore_params(download.maybe_download(params_path), restore_type=np.ndarray)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"{params_path} is not a params checkpoint ({error}). --weight-loader.params-path must end in "
+            "<step>/params, e.g. <experiment>/<exp-name>/19999/params: not a step directory, not an experiment root."
+        ) from error
+
+
 @runtime_checkable
 class WeightLoader(Protocol):
     def load(self, params: at.Params) -> at.Params:
@@ -54,7 +66,7 @@ class CheckpointWeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        loaded_params = _restore_params(self.params_path)
         _refuse_unwanted_lit(loaded_params, params)
         # Add all missing LoRA weights (and whatever else missing_regex names).
         return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
@@ -84,18 +96,22 @@ class PaliGemmaWeightLoader(WeightLoader):
 LIT_MISSING_REGEX = ".*lora.*|lit_.*"
 
 
-def _lit_roots(tree: at.Params) -> list[str]:
-    return sorted(str(key) for key in tree if str(key).startswith("lit_"))
+def _lit_leaves(tree: at.Params) -> set[str]:
+    return {key for key in flax.traverse_util.flatten_dict(tree, sep="/") if key.startswith("lit_")}
 
 
 def _refuse_unwanted_lit(loaded_params: at.Params, params: at.Params) -> None:
-    """A checkpoint with LIT modules loaded into a model that has none (lit="off") would have them dropped without a
-    word, and the stock model that is left would train on weights that were trained to work with them: refuse. (The
-    serving path has the same refusal in Pi0Config.load.)"""
-    if (stray := _lit_roots(loaded_params)) and not _lit_roots(params):
+    """The generic loader's merge keeps only the checkpoint leaves the model has: a lit_* leaf the model lacks would be
+    dropped without a word. A stock model (lit="off") loaded from a LIT checkpoint would train on weights that were
+    trained to work with the dropped modules, and a stage-2 model given a stage-1 checkpoint would lose the goal encoder
+    (the hand-off of that is LitStage1WeightLoader, which checks what it does). Refuse. (The serving path has the same
+    refusal for lit="off" in Pi0Config.load.)"""
+    if stray := sorted(_lit_leaves(loaded_params) - _lit_leaves(params)):
+        roots = sorted({key.split("/")[0] for key in stray})
         raise ValueError(
-            f"the checkpoint carries LIT parameters {stray} but the model has none (lit='off'): loading it would "
-            "silently drop them and leave a stock model with weights trained to work with them. Use a lit config."
+            f"the checkpoint carries LIT leaves the model lacks ({roots}, e.g. {stray[:2]}): loading it would silently "
+            "drop them and leave weights trained to work with them. Use a lit config of the same stage; a stage-1 "
+            "checkpoint initialises a stage-2 model through LitStage1WeightLoader."
         )
 
 
@@ -112,7 +128,7 @@ class LitStage1WeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         if not self.params_path:
             raise ValueError("pass the stage-1 checkpoint's params directory: --weight-loader.params-path=<dir>.")
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        loaded_params = _restore_params(self.params_path)
         return _stage1_handoff(loaded_params, params)
 
 
@@ -127,6 +143,13 @@ def _stage1_handoff(loaded_params: at.Params, params: at.Params) -> at.Params:
         key.startswith("lit_goal_encoder/") for key in flat_ref
     ):
         raise ValueError("a stage-1 checkpoint initialises a lit='stage2' model, and this one is not.")
+
+    # Every checkpoint leaf is consumed by the model or is the goal encoder: a leaf the stage-2 model lacks would be
+    # dropped by the merge without a word.
+    if dropped := sorted(key for key in flat_loaded if key not in flat_ref and not key.startswith("lit_goal_encoder/")):
+        raise ValueError(
+            f"the stage-1 checkpoint has leaves the stage-2 model lacks, e.g. {dropped[:3]}: not dropping them."
+        )
 
     merged = _merge_params(loaded_params, params, missing_regex=LIT_MISSING_REGEX)
 
