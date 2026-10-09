@@ -31,8 +31,10 @@ from openpi.training import data_loader as _data_loader
 from openpi.training import lit_train as _lit_train
 from openpi.training import optimizer as _optimizer
 from openpi.training import sharding
+from openpi.training import lit_data_test as _data
 from openpi.training import utils as training_utils
 
+from . import compute_norm_stats
 from . import train
 
 BATCH = _utils.BATCH
@@ -479,6 +481,70 @@ def test_a_stock_run_logs_no_lit_keys(tmp_path, monkeypatch, caplog):
     for point in points:
         assert {"loss", "grad_norm", "param_norm"} <= set(point)
         assert not any(k.startswith(("pose", "action_loss", "grad_norm_")) for k in point)
+
+
+# ---- a batch of the real data chain through the real step ----
+
+
+def _chain_batch(model_config, tmp_path, frames=(0, 4, 9, 12)):
+    """(Observation, actions) as the data loader makes them: synthetic LeRobot samples through the recipe's real
+    transform chain, collated and turned into an Observation, for a tiny model config (14 dims, no padding)."""
+    data_config = _data._data_config(model_config, tmp_path)  # noqa: SLF001
+    items = _data._transformed(data_config, [_data._raw_sample(f) for f in frames])  # noqa: SLF001
+    batch = jax.tree.map(jnp.asarray, _data_loader._collate_fn(items))  # noqa: SLF001
+    return _model.Observation.from_dict(batch), batch["actions"]
+
+
+@pytest.mark.parametrize("stage", ["stage1", "stage2"])
+def test_a_batch_from_the_real_transform_chain_trains_a_step(tmp_path, stage):
+    """The loader's output, not a hand-made batch: all three cameras (stage 1 still needs the images dict), the goal
+    normalised like the state, the clamped end-of-episode goals flagged. One step is finite, with a real pose loss at
+    stage 2 and the copy baseline in both."""
+    model = _model_config(stage, lit_goal_dims=_data.GOAL_DIMS, action_horizon=_data.H)
+    observation, actions = _chain_batch(model, tmp_path)
+    assert set(observation.images) == set(_model.IMAGE_KEYS)
+    assert observation.lit_goal_mask.tolist() == [True, False, False, True]
+    config = _train_config(model)
+    state = _state(config)
+    new_state, info = _jitted(config)(jax.random.key(0), state, (observation, actions))
+    assert int(new_state.step) == 1
+    assert np.isfinite(float(info["loss"])) and float(info["pose_copy_baseline"]) > 0.0
+    assert ("pose_loss" in info) == (stage == "stage2")
+
+
+def test_compute_norm_stats_runs_on_a_lit_config_and_gets_the_stock_statistics(monkeypatch, tmp_path):
+    """The statistics pass reads state and actions only: a LIT config (two state rows, the goal split off before the
+    repack) gives the same state and action batches as the stock one, and does not trip over the goal keys."""
+    seen = {}
+
+    class Dataset(list):
+        def __init__(self, repo_id, delta_timestamps=None, **kwargs):
+            super().__init__()
+            seen["keys"] = sorted(delta_timestamps)
+
+        def __getitem__(self, index):
+            lit = "observation.state" in seen["keys"]
+            return _data._raw_sample(index % 20, split=False, goal_rows=lit)  # noqa: SLF001
+
+        def __len__(self):
+            return 20
+
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", _data._Meta)  # noqa: SLF001
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", Dataset)
+    batches = {}
+    for stage in ("off", "stage2"):
+        goal = {"lit_goal_dims": _data.GOAL_DIMS} if stage != "off" else {}
+        model = _model_config(stage, action_horizon=_data.H, **goal)
+        data_config = _data._data_config(model, tmp_path)  # noqa: SLF001
+        loader, num_batches = compute_norm_stats.create_torch_dataloader(
+            data_config, model.action_horizon, 4, model, num_workers=0
+        )
+        batches[stage] = next(iter(loader))
+        assert num_batches == 5
+    assert "observation.state" in seen["keys"]
+    assert {"lit_goal", "lit_goal_mask"} <= set(batches["stage2"]) and "lit_goal" not in batches["off"]
+    for key in ("state", "actions"):
+        np.testing.assert_array_equal(np.asarray(batches["off"][key]), np.asarray(batches["stage2"][key]))
 
 
 # ---- scripts that do not train LIT ----
